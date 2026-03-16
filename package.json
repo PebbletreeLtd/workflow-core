@@ -1,8 +1,9 @@
 {
   "name": "@pebbletree/workflow-core",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Core workflow functions",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
