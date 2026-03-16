@@ -80,5 +80,13 @@ export type { PickContext, PickedJob } from "./workflowPicker"
 export { WorkflowEngine } from "./workflowEngine"
 export type { WorkflowEngineOptions } from "./workflowEngine"
 
+// Server workflow (high-level orchestrator with token ring integration)
+export { ServerWorkflow } from "./serverWorkflow"
+export type {
+    ServerWorkflowCreateOptions,
+    TokenRingFactory,
+    TokenRingInstance,
+} from "./serverWorkflow"
+
 // Simulated (in-memory) job manager for testing
 export { SimulatedJobManager } from "./simulatedJobManager"
