@@ -1,7 +1,17 @@
 {
   "name": "@pebbletree/workflow-core",
-  "version": "1.0.1",
-  "description": "Core workflow functions",
+  "version": "1.0.2",
+  "description": "Database-agnostic workflow engine for TypeScript — job picking, execution, retry, scheduling, and capability-based routing with pluggable storage adapters",
+  "keywords": [
+    "workflow",
+    "job-queue",
+    "background-jobs",
+    "task-scheduler",
+    "retry",
+    "job-manager",
+    "capability-routing",
+    "typescript"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
