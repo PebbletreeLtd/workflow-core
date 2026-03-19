@@ -28,10 +28,6 @@ export type {
     WorkflowJobLogOutcome,
     WorkflowJobLogKey,
     WorkflowJobLogValue,
-    WorkflowConfig,
-    JobRunnerFunction,
-    JobRunner,
-    BaseJobManager,
 } from "./workflowTypes"
 
 export {
@@ -45,18 +41,10 @@ export {
 // Storage adapter
 export type {
     WorkflowJobStorage,
-    WorkflowJobStorageTransaction,
 } from "./workflowStorageAdapter"
 
 // Capabilities
 export { WorkflowCapabilities } from "./workflowCapabilities"
-
-// Capability buffer (low-level bitmap encode/decode)
-export {
-    capabilitiesToBuffer,
-    bufferToCapabilities,
-    mergeCapabilityBuffers,
-} from "./capabilityBuffer"
 
 // Counter / metrics
 export { WorkflowCounter } from "./counter"
@@ -68,25 +56,22 @@ export { computeNextSchedule } from "./schedule"
 // Job errors
 export { JobError, JobFatalError } from "./jobErrors"
 
-// Job manager
-export { JobManager } from "./jobManager"
-export type { JobManagerOptions } from "./jobManager"
+// Job runner
+export { JobRunner } from "./jobRunner"
+export type { JobRunnerOptions, JobRunnerConstructor } from "./jobRunner"
 
 // Picker
 export { WorkflowPicker } from "./workflowPicker"
-export type { PickContext, PickedJob } from "./workflowPicker"
+export type { PickContext, PickedJob, WorkflowPickerArgs } from "./workflowPicker"
 
 // Engine (orchestrator)
 export { WorkflowEngine } from "./workflowEngine"
 export type { WorkflowEngineOptions } from "./workflowEngine"
 
-// Server workflow (high-level orchestrator with token ring integration)
-export { ServerWorkflow } from "./serverWorkflow"
-export type {
-    ServerWorkflowCreateOptions,
-    TokenRingFactory,
-    TokenRingInstance,
-} from "./serverWorkflow"
 
-// Simulated (in-memory) job manager for testing
-export { SimulatedJobManager } from "./simulatedJobManager"
+// Simulated (in-memory) job runner for testing
+export { SimulatedJobRunner } from "./simulatedJobRunner"
+export type { SimulatedJobRunnerOptions } from "./simulatedJobRunner"
+
+// In-memory storage
+export { InMemoryJobStorage } from "./inMemoryStorage"

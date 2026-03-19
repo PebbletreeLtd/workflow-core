@@ -180,46 +180,4 @@ export interface WorkflowJobLogValue {
     execution_id: string
 }
 
-// =========================================================================
-// Workflow config (generic subset)
-// =========================================================================
 
-export interface WorkflowConfig {
-    workflow_server_reregister_time_ms: number
-    workflow_token_ack_timeout_ms: number
-    workflow_batch_size: number
-    workflow_ideal_maximum_jobs_running: number
-    workflow_max_job_retention_age_days: number | undefined
-    workflow_supress_job_outcome_logs: string[]
-}
-
-// =========================================================================
-// Runner types
-// =========================================================================
-
-export type JobRunnerFunction<PAYLOAD_T extends BasicJobPayload> =
-    (mgr: BaseJobManager<PAYLOAD_T>, oopE: Promise<any>) => Promise<void | number>
-
-/**
- * A job runner is simply a function. Post-processing logic (which needs
- * transactional database access) is handled by the storage adapter's
- * `processJobOutcome` hook instead of being bundled with the runner.
- */
-export type JobRunner<PAYLOAD_T extends BasicJobPayload> = JobRunnerFunction<PAYLOAD_T>
-
-// =========================================================================
-// Base job manager interface
-// =========================================================================
-
-export interface BaseJobManager<PAYLOAD_T extends BasicJobPayload> {
-    Wait(duration: number): Promise<number | undefined>
-    GetJob(): Promise<{
-        header: Readonly<WorkflowJobHeader>
-        payload: PAYLOAD_T
-    }>
-    Progress(payload?: Partial<PAYLOAD_T>): Promise<{
-        header: Readonly<WorkflowJobHeader>
-        payload: PAYLOAD_T
-    }>
-    readonly jobKey: Readonly<WorkflowJobKey>
-}

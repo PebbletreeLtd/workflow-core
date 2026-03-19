@@ -1,29 +1,29 @@
 /**
  * Generic workflow capabilities system.
  * 
- * Maps numeric job types to runner functions and manages the capability
+ * Maps job types to JobRunner constructors and manages the capability
  * bitmap buffer. The consumer provides the runner map at construction time —
  * the package has no knowledge of specific job types or processor implementations.
  */
-import { capabilitiesToBuffer, bufferToCapabilities, mergeCapabilityBuffers } from "./capabilityBuffer"
-import type { BasicJobPayload, JobRunner } from "./workflowTypes"
+import type { BasicJobPayload } from "./workflowTypes"
+import type { JobRunnerConstructor } from "./jobRunner"
 
 export class WorkflowCapabilities<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> {
-    /** Map of numeric job type → runner */
-    readonly runnerMap: ReadonlyMap<number, JobRunner<PAYLOAD_T>>
+    /** Map of job type → JobRunner constructor */
+    readonly runnerMap: ReadonlyMap<PAYLOAD_T["type"], JobRunnerConstructor<PAYLOAD_T>>
     /** Compact bitmap encoding of which types this server can run */
     readonly capabilitiesBuffer: Buffer
 
-    constructor(args: {
-        /** All possible numeric job type values, sorted ascending */
-        allSortedCapabilities: number[]
-        /** Map of numeric job type → runner function/object for types this server can handle */
-        runners: Map<number, JobRunner<PAYLOAD_T>>
+    protected constructor(args: {
+        /** All possible job type values, sorted ascending */
+        allCapabilities: PAYLOAD_T["type"][],
+        /** Map of job type → JobRunner constructor for types this server can handle */
+        runners: Map<PAYLOAD_T["type"], JobRunnerConstructor<PAYLOAD_T>>
     }) {
         this.runnerMap = args.runners
-        this.capabilitiesBuffer = capabilitiesToBuffer(
+        this.capabilitiesBuffer = WorkflowCapabilities.capabilitiesToBuffer(
             Array.from(args.runners.keys()),
-            args.allSortedCapabilities,
+            args.allCapabilities,
         )
     }
 
@@ -32,51 +32,99 @@ export class WorkflowCapabilities<PAYLOAD_T extends BasicJobPayload = BasicJobPa
      * Accepts either a numeric type value or a string type name that will
      * be resolved via the provided enum lookup.
      */
-    canRunType(type: number): boolean
-    canRunType(type: string, enumLookup: Record<string, number>): boolean
-    canRunType(type: number | string, enumLookup?: Record<string, number>): boolean {
-        const numericType = typeof type === "string"
-            ? enumLookup?.[type]
-            : type
-        if (numericType === undefined) return false
-        return this.runnerMap.has(numericType)
+
+    canRunType(type: PAYLOAD_T["type"]): boolean {
+        return this.runnerMap.has(type)
     }
 
     /**
-     * Get the runner for a given job payload.
+     * Get the runner constructor for a given job payload.
      * Returns null if no runner is registered for this payload type.
      */
-    getRunner(payload: PAYLOAD_T, enumLookup: Record<string, number>): JobRunner<PAYLOAD_T> | null {
-        const enumValue = enumLookup[payload.type]
-        if (enumValue === undefined) {
-            console.error("Capability type " + payload.type + " not found in enum lookup")
-            return null
-        }
-        return (this.runnerMap.get(enumValue) as JobRunner<PAYLOAD_T>) ?? null
+    getRunner(payload: PAYLOAD_T): JobRunnerConstructor<PAYLOAD_T> | null {
+        return this.runnerMap.get(payload.type) ?? null
     }
 
-    // =========================================================================
-    // Static bitmap utilities
-    // =========================================================================
 
+    // =========================================================================
+    // Statics
+    // =========================================================================
     /**
-     * Convert an array of numeric capability values to a bitmap buffer.
+     * Capability buffer utilities.
+     * 
+     * Pure bitwise logic for encoding, decoding, and merging capability bitmaps.
+     * No dependencies beyond Node Buffer — ready for extraction.
      */
-    static convertCapabilitiesArrayToBuffer(capabilities: number[], allSorted: number[]): Buffer {
-        return capabilitiesToBuffer(capabilities, allSorted)
-    }
 
     /**
      * Merge two capability buffers using bitwise OR.
+     * Returns a buffer large enough to contain the larger of the two inputs.
+     * 
+     * @param target The buffer to merge INTO (modified in place, or replaced if too small)
+     * @param source The buffer to merge FROM
      */
     static mergeCapabilityBuffers(target: Buffer, source: Buffer): Buffer {
-        return mergeCapabilityBuffers(target, source)
+        const maxLen = Math.max(target.length, source.length)
+        if (target.length < maxLen) {
+            const newBuffer = Buffer.alloc(maxLen)
+            target.copy(newBuffer)
+            target = newBuffer
+        }
+        for (let i = 0; i < source.length; i++) {
+            target[i] = target[i]! | source[i]!
+        }
+        return target
     }
 
     /**
-     * Decode a capability buffer back to an array of numeric values.
+     * Convert an array of string capability values to a bitmap buffer.
+     * Each capability N occupies bit (N-1) in the buffer: byte Math.floor((N-1)/8), bit (N-1)%8.
+     * 
+     * @param capabilities The capability values to encode
+     * @param allSorted All possible capability values, sorted ascending. Used to determine buffer size.
+     */
+    static capabilitiesToBuffer<T extends string>(capabilities: T[], allSorted: T[]): Buffer {
+        const maxValue = allSorted.length
+        if (maxValue === undefined) throw new Error("No capabilities defined")
+        const buffer = Buffer.alloc(Math.ceil(maxValue / 8))
+        for (const [idx, cap] of allSorted.entries()) {
+            if (capabilities.includes(cap)) {
+                const byteIdx = Math.floor(idx / 8)
+                const bitIdx = (idx) % 8
+                buffer[byteIdx]! |= (1 << bitIdx)
+            }
+        }
+        return buffer
+    }
+
+    /**
+     * Decode a capability bitmap buffer back to an array of capability values.
+     * Inverse of capabilitiesToBuffer.
+     * 
+     * @param buffer The bitmap buffer to decode
+     * @param allSorted All possible capability values, sorted ascending.
      */
     static bufferToCapabilities(buffer: Buffer, allSorted: number[]): number[] {
-        return bufferToCapabilities(buffer, allSorted)
+        const ret: number[] = []
+        for (const cap of allSorted) {
+            const byteIdx = Math.floor((cap - 1) / 8)
+            const bitIdx = (cap - 1) % 8
+            const byte = buffer[byteIdx]
+            if (byte !== undefined && (byte & (1 << bitIdx))) {
+                ret.push(cap)
+            }
+        }
+        return ret
+    }
+
+    static Create<T extends string[]>(allCapabilities: T) {
+        return <PAYLOAD_T extends BasicJobPayload & { type: T[number] }>(args: {
+            runners: Map<PAYLOAD_T["type"] & T[number], JobRunnerConstructor<PAYLOAD_T>>
+        }) => {
+            return new WorkflowCapabilities<PAYLOAD_T>({
+                runners: args.runners,
+                allCapabilities
+            })
+        }
     }
 }

@@ -1,3 +1,4 @@
+
 /**
  * Vitest global setup — silences console output unless VERBOSE=1.
  *

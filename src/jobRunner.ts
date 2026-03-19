@@ -1,8 +1,11 @@
 /**
- * Core job manager implementation.
+ * Core job runner implementation.
  * 
  * Manages the lifecycle of a single running workflow job: progress reporting,
  * pushback timers, error handling, retry/reschedule logic, and outcome logging.
+ * 
+ * Subclass this and implement `runJob()` to define the actual work for a
+ * specific job type. The runner has access to all manager methods via `this`.
  * 
  * All database access goes through the injected WorkflowJobStorage adapter.
  */
@@ -13,39 +16,33 @@ import type {
     WorkflowJobValue,
     WorkflowJobOutcome,
     WorkflowJobError,
-    WorkflowJobLogCustomEntry,
-    BaseJobManager,
-    WorkflowConfig,
 } from "./workflowTypes"
 import { durationMinutes } from "./workflowTypes"
-import type { WorkflowJobStorage } from "./workflowStorageAdapter"
 import { JobError } from "./jobErrors"
 import { computeNextSchedule } from "./schedule"
 import { WorkflowCounter } from "./counter"
-import crypto from "crypto"
+import { MVCCCore } from "@pebbletree/mvcc-testing"
+import { WorkflowJobStorage } from "./workflowStorageAdapter"
+import { v4 } from "uuid"
 
-export interface JobManagerOptions<PAYLOAD_T extends BasicJobPayload> {
+export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
     jobKey: Readonly<WorkflowJobKey>
-    execution_id: string
-    workflow_supress_job_outcome_logs: WorkflowConfig["workflow_supress_job_outcome_logs"]
-    storage: WorkflowJobStorage<PAYLOAD_T>
-    suppress_error_emails?: boolean
+    execution_id: string,
+    store: WorkflowJobStorage<PAYLOAD_T>
     /**
-     * Called on fatal/vanished/rescheduled-error outcomes so the consumer
-     * can trigger notifications (e.g. error emails). Replaces the monorepo's
-     * WorkflowDbModule.ScheduleForwardEmail.
+     * Optional promise that must resolve before the first store read.
+     * Used by SimulatedJobRunner to ensure the seed transaction commits first.
      */
-    onFatalError?: (args: {
-        job: WorkflowJobValue<PAYLOAD_T>
-        jobKey: WorkflowJobKey
-        outcome: WorkflowJobOutcome
-    }) => Promise<void>
+    ready?: Promise<unknown>
 }
 
-type JobRunnerFn<PAYLOAD_T extends BasicJobPayload> =
-    (mgr: JobManager<PAYLOAD_T>, oopE: Promise<any>) => Promise<void | number>
+/** Constructor type for a concrete JobRunner subclass. */
+export type JobRunnerConstructor<PAYLOAD_T extends BasicJobPayload> =
+    { new(args: JobRunnerOptions<PAYLOAD_T>): JobRunner<PAYLOAD_T> }
 
-export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobManager<PAYLOAD_T> {
+
+
+export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
     readonly outofProcessError = (() => {
         let callback: any = undefined
         const promise = new Promise<void>((_, E) => {
@@ -60,29 +57,41 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
     private startTime = Date.now()
     private static readonly runningJobs = new Map<string, number>()
     private static totalRunningJobs = 0
-
-    private readonly storage: WorkflowJobStorage<PAYLOAD_T>
-    readonly workflow_supress_job_outcome_logs: WorkflowConfig["workflow_supress_job_outcome_logs"]
-    private readonly suppress_error_emails: boolean
-    private readonly onFatalError?: JobManagerOptions<PAYLOAD_T>["onFatalError"]
-
+    private _store: WorkflowJobStorage<PAYLOAD_T>
     private _job: Promise<{
         header: Readonly<WorkflowJobHeader>
         payload: PAYLOAD_T
         for_userspace_id: string | null
-    }>
+    }> | undefined
     private readonly execution_id: string
+    private readonly _ready: Promise<unknown> | undefined
     readonly jobKey: Readonly<WorkflowJobKey>
 
-    constructor(args: JobManagerOptions<PAYLOAD_T>) {
+    /** The storage adapter backing this runner. */
+    get store(): WorkflowJobStorage<PAYLOAD_T> { return this._store }
+
+    /**
+     * Resolves once any setup work (e.g. seed transactions) is complete.
+     * Useful when you need to access the store directly before calling Run().
+     */
+    async whenReady(): Promise<void> { if (this._ready) await this._ready }
+
+    constructor(args: JobRunnerOptions<PAYLOAD_T>) {
         this.execution_id = args.execution_id
-        this.workflow_supress_job_outcome_logs = args.workflow_supress_job_outcome_logs
-        this.suppress_error_emails = args.suppress_error_emails ?? false
-        this.storage = args.storage
         this.jobKey = args.jobKey
-        this.onFatalError = args.onFatalError
-        this._job = this.GetUpdatedJob()
+        this._store = args.store
+        this._ready = args.ready
     }
+
+    /**
+     * Implement this method to define the actual work for this job type.
+     * Has full access to the runner via `this` — call `this.GetJob()`,
+     * `this.Progress()`, `this.Wait()`, etc.
+     * 
+     * Return `void` for normal completion, or a future timestamp (number)
+     * to reschedule the job.
+     */
+    abstract runJob(): Promise<void | number>
 
     static get JobRunningCount() {
         return { total: this.totalRunningJobs, types: Array.from(this.runningJobs) }
@@ -100,12 +109,18 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
         return undefined
     }
 
-    private async GetUpdatedJob(): Promise<{
+    private async GetUpdatedJob(
+        txn?: MVCCCore.ITransaction<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>>
+    ): Promise<{
         header: Readonly<WorkflowJobHeader>
         payload: PAYLOAD_T
-        for_userspace_id: string | null
+        for_userspace_id: string | null,
     }> {
-        const job = await this.storage.getJob(this.jobKey)
+        if (!txn) {
+            if (this._ready) await this._ready
+            return this._store.doTn(txn => this.GetUpdatedJob(txn))
+        }
+        const job = await txn.get(this.jobKey)
         if (!job) {
             throw new JobError({ type: "vanished" })
         } else if (job.header.execution_id !== this.execution_id) {
@@ -118,6 +133,9 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
         if (this.completed) {
             throw new Error("Job not running")
         }
+        if (!this._job) {
+            this._job = this.GetUpdatedJob()
+        }
         if (!this.progressTimer) {
             this.ResetProgressTimer((await this._job).header.progress_deadline_ms)
         }
@@ -126,23 +144,17 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
     }
 
     private async ResetJob(options: { progress: boolean, payload?: Partial<PAYLOAD_T> }) {
-        this._job = (async () => {
-            const updated = await this.storage.updateJob(
-                this.jobKey,
-                this.execution_id,
-                (job) => {
-                    const amended = { ...job, header: { ...job.header } }
-                    if (options.progress) amended.header.at = Date.now() + job.header.lost_deadline_ms
-                    if (options.payload) amended.payload = { ...amended.payload, ...options.payload }
-                    if (options.progress || !amended.header.last_progress) {
-                        amended.header.last_progress = Date.now()
-                    }
-                    return amended
-                }
-            )
-            if (!updated) throw new JobError({ type: "vanished" })
-            return updated
-        })()
+        this._job = this._store.doTn(async txn => {
+            const job = await this.GetUpdatedJob(txn)
+            const amended = { ...job, header: { ...job.header } }
+            if (options.progress) amended.header.at = Date.now() + job.header.lost_deadline_ms
+            if (options.payload) amended.payload = { ...amended.payload, ...options.payload }
+            if (options.progress || !amended.header.last_progress) {
+                amended.header.last_progress = Date.now()
+            }
+            txn.set(this.jobKey, amended)
+            return amended
+        })
         const job = await this.GetJob()
         if (options.progress) this.ResetProgressTimer(job.header.progress_deadline_ms)
         this.ResetPushBackTimer(job.header.lost_deadline_ms / 2.5)
@@ -176,66 +188,62 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
         return this.ResetJob({ progress: true, payload })
     }
 
-    async Log(entry: WorkflowJobLogCustomEntry) {
-        const at = Date.now()
-        await this.storage.writeLog(
-            { job_id: this.jobKey.job_id, timestamp: Date.now(), random: crypto.randomUUID() },
-            { at, execution_id: this.execution_id, outcome: entry }
-        )
-    }
 
-    async Run(
-        runner: JobRunnerFn<PAYLOAD_T>,
-    ): Promise<WorkflowJobOutcome> {
-        const job = await this.GetJob()
+    async Run(): Promise<WorkflowJobOutcome> {
+        let job: Awaited<ReturnType<typeof this.GetJob>>
+        try {
+            job = await this.GetJob()
+        } catch (e) {
+            if (e instanceof JobError) return e.outcome as WorkflowJobOutcome
+            throw e
+        }
         const outcome = await (async () => {
             try {
                 console.debug("Workflow starting job", this.jobKey, job.header, job.payload)
-                const running = (JobManager.runningJobs.get(job.payload.type) || 0) + 1
-                JobManager.totalRunningJobs++
-                JobManager.runningJobs.set(job.payload.type, running)
+                const running = (JobRunner.runningJobs.get(job.payload.type) || 0) + 1
+                JobRunner.totalRunningJobs++
+                JobRunner.runningJobs.set(job.payload.type, running)
 
                 const result = await Promise.race([
-                    runner(this, this.outofProcessError.promise),
+                    this.runJob(),
                     this.outofProcessError.promise,
                 ])
                 this.clearTimers()
 
                 // Success path: clear/reschedule + post-processing in one transaction
-                return await this.storage.runInTransaction(async (txn) => {
+                return await this._store.doTn(async (txn) => {
                     let outcome: WorkflowJobOutcome = { type: "success" }
-
-                    // Post-processing hook (storage adapter's case statement)
-                    if (txn.processJobOutcome) {
-                        outcome = await txn.processJobOutcome({
-                            outcome, payload: job.payload, jobKey: this.jobKey,
-                        })
-                    }
-
-                    const currentJob = await txn.getJob(this.jobKey)
-                    if (!currentJob || currentJob.header.execution_id !== this.execution_id) {
+                    const job = await txn.get(this.jobKey)
+                    if (!job || job.header.execution_id !== this.execution_id) {
                         return outcome
                     }
+                    // Post-processing hook (storage adapter's case statement)
+                    outcome = await this.onJobOutcome({
+                        outcome,
+                        payload: job.payload,
+                        jobKey: this.jobKey,
+                        txn
+                    })
 
                     if (result) {
                         // Runner returned a future timestamp — reschedule
-                        txn.setJob(this.jobKey, {
-                            ...currentJob,
-                            header: { ...currentJob.header, at: result, execution_id: undefined },
+                        txn.set(this.jobKey, {
+                            ...job,
+                            header: { ...job.header, at: result, execution_id: undefined },
                         })
                     } else {
                         // Clear the job (complete or reschedule if repeating)
-                        const next_schedule = computeNextSchedule(currentJob.header)
+                        const next_schedule = computeNextSchedule(job.header)
                         if (next_schedule) {
                             console.debug("Rescheduling job for", next_schedule)
-                            txn.setJob(this.jobKey, {
-                                ...currentJob,
-                                header: { ...currentJob.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined },
+                            txn.set(this.jobKey, {
+                                ...job,
+                                header: { ...job.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined },
                             })
                         } else {
-                            txn.setJob(this.jobKey, {
-                                ...currentJob,
-                                header: { ...currentJob.header, at: 0 - Math.abs(currentJob.header.at), execution_id: undefined },
+                            txn.set(this.jobKey, {
+                                ...job,
+                                header: { ...job.header, at: 0 - Math.abs(job.header.at), execution_id: undefined },
                             })
                         }
                     }
@@ -251,18 +259,17 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
                         ? { type: "custom-recoverable", message: e.message }
                         : { type: "custom-recoverable", message: String(e) }
 
-                const config = this.workflow_supress_job_outcome_logs || ["success"]
 
                 // Handle error within a transactional context
-                return await this.storage.runInTransaction(async (txn) => {
-                    const currentJob = await txn.getJobByJobId(this.jobKey.job_id)
+                return await this._store.doTn(async (txn) => {
+                    const currentJob = await txn.get(this.jobKey)
                     if (!currentJob) return { type: "vanished" } as WorkflowJobOutcome
 
                     let outcome = await (async (): Promise<WorkflowJobOutcome> => {
                         switch (err.type) {
                             case "vanished":
                                 // Clear the job
-                                txn.setJob(this.jobKey, {
+                                txn.set(this.jobKey, {
                                     ...currentJob,
                                     header: { ...currentJob.header, at: 0 - Math.abs(currentJob.header.at), execution_id: undefined }
                                 })
@@ -275,18 +282,18 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
                                     currentJob.header.at = Date.now() + currentJob.header.retries.initial_backoff_ms
                                     currentJob.header.retries.initial_backoff_ms *= currentJob.header.retries.exponent
                                     currentJob.header.execution_id = undefined
-                                    txn.setJob(this.jobKey, currentJob)
+                                    txn.set(this.jobKey, currentJob)
                                     return { type: "rescheduled-error", cause: err as any }
                                 } else {
                                     // Clear via schedule or negate at
                                     const next_schedule = computeNextSchedule(currentJob.header)
                                     if (next_schedule) {
-                                        txn.setJob(this.jobKey, {
+                                        txn.set(this.jobKey, {
                                             ...currentJob,
                                             header: { ...currentJob.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined }
                                         })
                                     } else {
-                                        txn.setJob(this.jobKey, {
+                                        txn.set(this.jobKey, {
                                             ...currentJob,
                                             header: { ...currentJob.header, at: 0 - Math.abs(currentJob.header.at), execution_id: undefined }
                                         })
@@ -299,12 +306,12 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
                                 // Clear via schedule or negate at
                                 const next_schedule = computeNextSchedule(currentJob.header)
                                 if (next_schedule) {
-                                    txn.setJob(this.jobKey, {
+                                    txn.set(this.jobKey, {
                                         ...currentJob,
                                         header: { ...currentJob.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined }
                                     })
                                 } else {
-                                    txn.setJob(this.jobKey, {
+                                    txn.set(this.jobKey, {
                                         ...currentJob,
                                         header: { ...currentJob.header, at: 0 - Math.abs(currentJob.header.at), execution_id: undefined }
                                     })
@@ -314,19 +321,12 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
                     })()
 
                     // Write log if outcome is not suppressed
-                    if (!config.find(v => v === outcome.type)) {
-                        txn.writeLog(
-                            { job_id: this.jobKey.job_id, timestamp: Date.now(), random: crypto.randomUUID() },
-                            { at: Date.now(), execution_id: this.execution_id, outcome }
-                        )
-                    }
+                    await this.WriteJobLog(txn, outcome)
 
                     // Post-processing hook (storage adapter's case statement)
-                    if (txn.processJobOutcome) {
-                        outcome = await txn.processJobOutcome({
-                            outcome, payload: currentJob.payload, jobKey: this.jobKey,
-                        })
-                    }
+                    outcome = await this.onJobOutcome({
+                        outcome, payload: currentJob.payload, jobKey: this.jobKey, txn
+                    })
 
                     // Notify on fatal errors via callback
                     switch (outcome.type) {
@@ -341,7 +341,7 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
                                     || currentJob.header.repeatSchedule.until.format !== "forever"
                                 )
                             ) break
-                            if (currentJob.payload.type !== "scheduled_email" && !this.suppress_error_emails && this.onFatalError) {
+                            if (currentJob.payload.type !== "scheduled_email") {
                                 // Fire and forget — don't let email failures affect the outcome
                                 this.onFatalError({
                                     job: currentJob,
@@ -359,12 +359,12 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
         })()
 
         // Update running count & metrics
-        const running_at_end = (JobManager.runningJobs.get(job.payload.type) || 0) - 1
+        const running_at_end = (JobRunner.runningJobs.get(job.payload.type) || 0) - 1
         if (running_at_end > 0)
-            JobManager.runningJobs.set(job.payload.type, running_at_end)
+            JobRunner.runningJobs.set(job.payload.type, running_at_end)
         else
-            JobManager.runningJobs.delete(job.payload.type)
-        JobManager.totalRunningJobs--
+            JobRunner.runningJobs.delete(job.payload.type)
+        JobRunner.totalRunningJobs--
 
         WorkflowCounter.pegValue({
             jobs: {
@@ -377,4 +377,36 @@ export class JobManager<PAYLOAD_T extends BasicJobPayload> implements BaseJobMan
         this.completed = true
         return outcome
     }
+
+    /**Override if to implement customize job log writing */
+    async WriteJobLog(
+        txn: MVCCCore.ITransaction<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>>,
+        outcome: WorkflowJobOutcome
+    ) {
+        const logTxn = txn.at(this._store.subspaces.jobLogKey)
+        logTxn.set(
+            { timestamp: Date.now(), job_id: this.jobKey.job_id, random: v4() },
+            { outcome }
+        )
+    }    /**
+     * Called on fatal / vanished / rescheduled-error outcomes so the implementer
+     * can trigger notifications (e.g. error emails).
+     * No-op by default.
+     */
+    async onFatalError(_args: {
+        job: WorkflowJobValue<PAYLOAD_T>
+        jobKey: WorkflowJobKey
+        outcome: WorkflowJobOutcome
+    }): Promise<void> {
+        console.warn("JobManager onFatalError called with no implementation")
+    }
+    /** Called on job outcome so the implementer can trigger notifications or other actions.
+     * Returns the outcome unchanged by default. */
+    async onJobOutcome(args: {
+        outcome: WorkflowJobOutcome
+        payload: PAYLOAD_T
+        jobKey: WorkflowJobKey,
+        txn: Pick<MVCCCore.ITransaction<unknown, unknown, unknown, unknown>, "at">
+    }): Promise<WorkflowJobOutcome> { return args.outcome }
 }
+

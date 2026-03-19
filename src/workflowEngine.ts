@@ -8,16 +8,13 @@
  */
 import type {
     BasicJobPayload,
-    WorkflowConfig,
     WorkflowJobKey,
     WorkflowJobOutcome,
     WorkflowJobValue,
-    JobRunnerFunction,
 } from "./workflowTypes"
-import type { WorkflowJobStorage } from "./workflowStorageAdapter"
 import { WorkflowPicker, type PickContext } from "./workflowPicker"
 import { WorkflowCapabilities } from "./workflowCapabilities"
-import { JobManager, type JobManagerOptions } from "./jobManager"
+import { JobRunner } from "./jobRunner"
 import { JobError } from "./jobErrors"
 import { WorkflowCounter } from "./counter"
 
@@ -28,15 +25,6 @@ import { WorkflowCounter } from "./counter"
 export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload> {
     pickers: WorkflowPicker<PAYLOAD_T>[]
     capabilities: WorkflowCapabilities<PAYLOAD_T>
-    config: WorkflowConfig
-    /** Maps string payload type names → numeric enum values */
-    enumLookup: Record<string, number>
-    suppress_error_emails?: boolean
-    /**
-     * Called on fatal / vanished / rescheduled-error outcomes so the consumer
-     * can trigger notifications (e.g. error emails).
-     */
-    onFatalError?: JobManagerOptions<PAYLOAD_T>["onFatalError"]
     /**
      * Wraps each job's execution. The consumer can add contextual logging,
      * tracing, or other cross-cutting concerns.
@@ -60,23 +48,11 @@ export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload> {
 // =========================================================================
 
 export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> {
-    private readonly pickers: WorkflowPicker<PAYLOAD_T>[]
-    private readonly capabilities: WorkflowCapabilities<PAYLOAD_T>
-    private readonly config: WorkflowConfig
-    private readonly enumLookup: Record<string, number>
-    private readonly suppress_error_emails: boolean
-    private readonly onFatalError?: WorkflowEngineOptions<PAYLOAD_T>["onFatalError"]
-    private readonly runJobWrapper?: WorkflowEngineOptions<PAYLOAD_T>["runJobWrapper"]
+
+
     private summaryInterval?: ReturnType<typeof setInterval>
 
-    constructor(options: WorkflowEngineOptions<PAYLOAD_T>) {
-        this.pickers = options.pickers
-        this.capabilities = options.capabilities
-        this.config = options.config
-        this.enumLookup = options.enumLookup
-        this.suppress_error_emails = options.suppress_error_emails ?? false
-        this.onFatalError = options.onFatalError
-        this.runJobWrapper = options.runJobWrapper
+    constructor(private options: WorkflowEngineOptions<PAYLOAD_T>) {
         if (options.summaryIntervalMs) {
             this.startSummaryInterval(options.summaryIntervalMs)
         }
@@ -94,7 +70,7 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
      */
     async pick(ctx: PickContext): Promise<{ pickedJobs: number }> {
         const allPicked = await Promise.all(
-            this.pickers.map(async (picker) => ({
+            this.options.pickers.map(async (picker) => ({
                 picker,
                 picked: await picker.pick(ctx),
             })),
@@ -105,7 +81,7 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
                 this.startJob({
                     jobKey,
                     job,
-                    storage: picker.storage,
+                    picker,
                     executorId: job.header.execution_id!,
                 }).catch((e) => {
                     console.error("Fatal error starting job", jobKey, e)
@@ -119,7 +95,7 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
     }
 
     /**
-     * Start a single job: resolve runner, create a JobManager, and run it.
+     * Start a single job: resolve runner, instantiate it, and run it.
      *
      * Typically called by `pick()`, but can also be invoked directly when
      * the caller already has a specific job to execute.
@@ -127,60 +103,54 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
     async startJob(args: {
         jobKey: WorkflowJobKey
         job: WorkflowJobValue<PAYLOAD_T>
-        storage: WorkflowJobStorage<PAYLOAD_T>
+        picker: WorkflowPicker<PAYLOAD_T>
         executorId: string
     }): Promise<WorkflowJobOutcome> {
-        const runner: JobRunnerFunction<PAYLOAD_T> = (() => {
-            try {
-                const r = this.capabilities.getRunner(args.job.payload, this.enumLookup)
-                if (!r) throw new Error("No runner found for capability " + args.job.payload.type)
-                return r
-            } catch (e: any) {
-                // Return an error-throwing runner so the job goes through the
-                // normal retry / fatal-error lifecycle.
-                return ((_mgr, _oopE) =>
-                    Promise.reject(
-                        new JobError({
-                            type: "custom-recoverable",
-                            message: e?.message ?? String(e),
-                        }),
-                    ))
+        const RunnerClass = (() => {
+            const Cls = this.options.capabilities.getRunner(args.job.payload)
+            if (Cls) return Cls
+            // Return an error runner so the job goes through the
+            // normal retry / fatal-error lifecycle.
+            return class ErrorRunner extends JobRunner<PAYLOAD_T> {
+                async runJob(): Promise<void | number> {
+                    throw new JobError({
+                        type: "custom-recoverable",
+                        message: `No runner found for capability ${args.job.payload.type}`,
+                    })
+                }
             }
         })()
 
-        const mgr = new JobManager<PAYLOAD_T>({
+        const runner = new RunnerClass({
             jobKey: args.jobKey,
             execution_id: args.executorId,
-            storage: args.storage,
-            workflow_supress_job_outcome_logs: this.config.workflow_supress_job_outcome_logs,
-            suppress_error_emails: this.suppress_error_emails,
-            onFatalError: this.onFatalError,
+            store: args.picker.storage,
         })
 
-        if (this.runJobWrapper) {
+        if (this.options.runJobWrapper) {
             let outcome: WorkflowJobOutcome = { type: "success" }
-            await this.runJobWrapper({
+            await this.options.runJobWrapper({
                 jobKey: args.jobKey,
                 payload: args.job.payload,
                 fn: async () => {
-                    outcome = await mgr.Run(runner)
+                    outcome = await runner.Run()
                     return outcome
                 },
             })
             return outcome
         }
 
-        return mgr.Run(runner)
+        return runner.Run()
     }
 
     /**
-     * Reset all orphaned jobs for the given executor across every picker's
+     * Reset all lost jobs for the given executor across every picker's
      * storage. Called when the ring detects an unresponsive server.
      */
-    async resetOrphanedJobs(executorId: string): Promise<number> {
+    async resetLostJobs(executorId: string): Promise<number> {
         let total = 0
-        for (const picker of this.pickers) {
-            total += await picker.storage.resetOrphanedJobs(executorId)
+        for (const picker of this.options.pickers) {
+            total += await picker.resetLostJobs(executorId)
         }
         return total
     }
@@ -200,7 +170,7 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
                 console.log(
                     "Work summary",
                     JSON.stringify({
-                        current: JobManager.JobRunningCount,
+                        current: JobRunner.JobRunningCount,
                         historic: WorkflowCounter.getDefaultCounter().getCurrentValue(),
                     }),
                 )

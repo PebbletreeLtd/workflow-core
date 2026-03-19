@@ -12,15 +12,18 @@ import type {
     BasicJobPayload,
     WorkflowJobKey,
     WorkflowJobValue,
-    WorkflowConfig,
-    JobRunnerFunction,
     WorkflowJobHeader,
-} from "../workflowTypes"
-import { durationSeconds } from "../workflowTypes"
-import { WorkflowEngine } from "../workflowEngine"
-import { WorkflowPicker } from "../workflowPicker"
-import { WorkflowCapabilities } from "../workflowCapabilities"
-import { InMemoryJobStorage } from "./storage"
+    WorkflowJobOutcome,
+} from "../src/workflowTypes"
+import { durationSeconds } from "../src/workflowTypes"
+import { WorkflowEngine } from "../src/workflowEngine"
+import { WorkflowPicker } from "../src/workflowPicker"
+import { WorkflowCapabilities } from "../src/workflowCapabilities"
+import { JobRunner, type JobRunnerConstructor } from "../src/jobRunner"
+import { SimulatedJobRunner, type SimulatedJobRunnerOptions } from "../src/simulatedJobRunner"
+import { JobError } from "../src/jobErrors"
+import { MVCCCore } from "@pebbletree/mvcc-testing"
+import { InMemoryJobStorage } from "../src/inMemoryStorage"
 
 // =========================================================================
 // Test payload type
@@ -38,32 +41,21 @@ export interface TestPayload extends BasicJobPayload {
 // Enum lookup – maps the string type "_test" → numeric value 1
 // =========================================================================
 
-export const TEST_ENUM_LOOKUP: Record<string, number> = { _test: 1 }
-export const ALL_SORTED_CAPABILITIES = [1]
+export const ALL_SORTED_CAPABILITIES: TestPayload["type"][] = ["_test"]
 
 // =========================================================================
 // Shared test storage (reset between tests via beforeEach)
 // =========================================================================
 
-export function createTestStorage(): InMemoryJobStorage<TestPayload> {
-    return new InMemoryJobStorage<TestPayload>()
+export function createTestStorage(args: {
+    typeIndex: boolean
+}): InMemoryJobStorage<TestPayload> {
+    return new InMemoryJobStorage<TestPayload>({
+        typeIndex: args.typeIndex
+    })
 }
 
-// =========================================================================
-// Default workflow config
-// =========================================================================
 
-export function testWorkflowConfig(overrides?: Partial<WorkflowConfig>): WorkflowConfig {
-    return {
-        workflow_server_reregister_time_ms: 60_000,
-        workflow_token_ack_timeout_ms: 500,
-        workflow_batch_size: 10,
-        workflow_ideal_maximum_jobs_running: 50,
-        workflow_max_job_retention_age_days: undefined,
-        workflow_supress_job_outcome_logs: ["success"],
-        ...overrides,
-    }
-}
 
 // =========================================================================
 // Job factory helpers
@@ -103,16 +95,16 @@ export function makeTestJobValue(overrides?: {
 }
 
 // =========================================================================
-// Test runner — executes the _test payload
+// Test runner — concrete SimulatedJobRunner for the _test payload type
 // =========================================================================
 
 /**
- * Creates a runner function that honours the test payload's shouldFail /
- * failType / delayMs / progressIntervalMs fields.
+ * A concrete SimulatedJobRunner that executes the _test payload, honouring
+ * shouldFail / failType / delayMs / progressIntervalMs fields.
  */
-export function createTestRunner(): JobRunnerFunction<TestPayload> {
-    return async (mgr, _oopE) => {
-        const { payload } = await mgr.GetJob()
+export class TestJobRunner extends SimulatedJobRunner<TestPayload> {
+    async runJob(): Promise<void | number> {
+        const { payload } = await this.GetJob()
         const delayMs = payload.delayMs ?? 0
 
         if (delayMs > 0) {
@@ -121,7 +113,7 @@ export function createTestRunner(): JobRunnerFunction<TestPayload> {
                 const steps = Math.ceil(delayMs / progressInterval)
                 for (let i = 0; i < steps; i++) {
                     await new Promise(r => setTimeout(r, progressInterval))
-                    await mgr.Progress()
+                    await this.Progress()
                 }
             } else {
                 await new Promise(r => setTimeout(r, delayMs))
@@ -129,7 +121,6 @@ export function createTestRunner(): JobRunnerFunction<TestPayload> {
         }
 
         if (payload.shouldFail) {
-            const { JobError } = await import("../jobErrors")
             switch (payload.failType) {
                 case "fatal":
                     throw new JobError({ type: "fatal-error", cause: { type: "custom", message: "test fatal" } })
@@ -143,38 +134,32 @@ export function createTestRunner(): JobRunnerFunction<TestPayload> {
     }
 }
 
+
 // =========================================================================
 // Engine factory — wires picker + capabilities + storage into an engine
 // =========================================================================
 
 export function createTestEngine(
     storage: InMemoryJobStorage<TestPayload>,
-    config?: Partial<WorkflowConfig>,
 ) {
-    const cfg = testWorkflowConfig(config)
+    const runners = new Map<TestPayload["type"], JobRunnerConstructor<TestPayload>>()
+    runners.set("_test", TestJobRunner)
 
-    const runners = new Map<number, JobRunnerFunction<TestPayload>>()
-    runners.set(1, createTestRunner())
-
-    const capabilities = new WorkflowCapabilities<TestPayload>({
-        allSortedCapabilities: ALL_SORTED_CAPABILITIES,
+    const capabilities = WorkflowCapabilities.Create(ALL_SORTED_CAPABILITIES)({
         runners,
     })
 
     const picker = new WorkflowPicker<TestPayload>({
         storage,
         capabilities,
-        config: cfg,
-        enumLookup: TEST_ENUM_LOOKUP,
+        batchSize: 10,
+        idealMaxRunning: 50,
     })
 
     const engine = new WorkflowEngine<TestPayload>({
         pickers: [picker],
         capabilities,
-        config: cfg,
-        enumLookup: TEST_ENUM_LOOKUP,
-        suppress_error_emails: true,
     })
 
-    return { engine, picker, capabilities, config: cfg, storage }
+    return { engine, picker, capabilities, storage }
 }
