@@ -9,18 +9,19 @@ import type { BasicJobPayload, WorkflowJobKey, WorkflowJobValue } from "./workfl
 import { JobRunner } from "./jobRunner"
 import { InMemoryJobStorage } from "./inMemoryStorage"
 import { v4 } from "uuid"
+import { WorkflowStorageTransaction } from "./workflowStorageAdapter"
 
 export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
     jobKey?: WorkflowJobKey
     job: WorkflowJobValue<PAYLOAD_T>
     typeIndex?: boolean
     /** Provide a shared store instead of creating a fresh one per runner. */
-    store?: InMemoryJobStorage<PAYLOAD_T>
 }
 
-export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload> extends JobRunner<PAYLOAD_T> {
+export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"]> extends JobRunner<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>> {
+    readonly memoryStore;
     constructor(options: SimulatedJobRunnerOptions<PAYLOAD_T>) {
-        const storage = options.store ?? new InMemoryJobStorage<PAYLOAD_T>({
+        const storage = new InMemoryJobStorage<PAYLOAD_T>({
             typeIndex: options.typeIndex ?? false,
         })
         const jobKey = options.jobKey ?? { job_id: v4() }
@@ -38,8 +39,8 @@ export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload> exte
         // We need to insert the job before the base class constructor reads it.
         // MVCCCore.Store.doTn is synchronous-start so we kick it off and let
         // the base class's GetUpdatedJob() await it naturally.
-        const seedPromise = storage.doTn(async txn => { txn.set(jobKey, job) })
-
-        super({ jobKey, execution_id, store: storage, ready: seedPromise })
+        const seedPromise = storage.doTn(async txn => { txn.job.set(jobKey, job) })
+        super({ jobKey, execution_id, store: storage, ready: seedPromise, type: job.payload.type as T })
+        this.memoryStore = storage
     }
 }

@@ -18,12 +18,14 @@ import type {
 import { durationSeconds } from "../src/workflowTypes"
 import { WorkflowEngine } from "../src/workflowEngine"
 import { WorkflowPicker } from "../src/workflowPicker"
-import { WorkflowCapabilities } from "../src/workflowCapabilities"
+import { capabilitiesToBuffer } from "../src/workflowCapabilities"
 import { JobRunner, type JobRunnerConstructor } from "../src/jobRunner"
 import { SimulatedJobRunner, type SimulatedJobRunnerOptions } from "../src/simulatedJobRunner"
 import { JobError } from "../src/jobErrors"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
 import { InMemoryJobStorage } from "../src/inMemoryStorage"
+import type { TokenRingRegistrationKey, TokenRingRegistrationValue } from "@pebbletree/tokenring"
+import { WorkflowStorageTransaction } from "../src/workflowStorageAdapter"
 
 // =========================================================================
 // Test payload type
@@ -90,7 +92,6 @@ export function makeTestJobValue(overrides?: {
             retries: overrides?.retries ?? { max: 0, initial_backoff_ms: 100, exponent: 2 },
             repeatSchedule: overrides?.repeatSchedule,
         },
-        for_userspace_id: null,
     }
 }
 
@@ -102,7 +103,7 @@ export function makeTestJobValue(overrides?: {
  * A concrete SimulatedJobRunner that executes the _test payload, honouring
  * shouldFail / failType / delayMs / progressIntervalMs fields.
  */
-export class TestJobRunner extends SimulatedJobRunner<TestPayload> {
+export class TestJobRunner extends SimulatedJobRunner<TestPayload, "_test"> {
     async runJob(): Promise<void | number> {
         const { payload } = await this.GetJob()
         const delayMs = payload.delayMs ?? 0
@@ -142,24 +143,59 @@ export class TestJobRunner extends SimulatedJobRunner<TestPayload> {
 export function createTestEngine(
     storage: InMemoryJobStorage<TestPayload>,
 ) {
-    const runners = new Map<TestPayload["type"], JobRunnerConstructor<TestPayload>>()
-    runners.set("_test", TestJobRunner)
+    const runners = new Map<TestPayload["type"], JobRunnerConstructor<TestPayload, "_test", WorkflowStorageTransaction<TestPayload>>>()
+    runners.set("_test", TestJobRunner as unknown as JobRunnerConstructor<TestPayload, "_test", WorkflowStorageTransaction<TestPayload>>)
 
-    const capabilities = WorkflowCapabilities.Create(ALL_SORTED_CAPABILITIES)({
-        runners,
-    })
-
-    const picker = new WorkflowPicker<TestPayload>({
+    const picker = new WorkflowPicker<TestPayload, WorkflowStorageTransaction<TestPayload>>({
         storage,
-        capabilities,
         batchSize: 10,
         idealMaxRunning: 50,
     })
 
-    const engine = new WorkflowEngine<TestPayload>({
-        pickers: [picker],
-        capabilities,
+    // Minimal ring membership storage for tests — never actually used
+    // because tests call engine.pick() directly rather than going through
+    // the token ring lifecycle.
+    const ringMembershipStore = new MVCCCore.Store<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>({
+        keyTransformer: {
+            pack: (_k: TokenRingRegistrationKey) => { throw new Error("not implemented") },
+            unpack: (_b: Buffer) => { throw new Error("not implemented") },
+        },
     })
 
-    return { engine, picker, capabilities, storage }
+    class TestEngine extends WorkflowEngine<TestPayload, WorkflowStorageTransaction<TestPayload>> {
+        InitialiseRunners(): void {
+            for (const [type, runner] of runners.entries()) {
+                this.AddRunner(type)(runner)
+            }
+        }
+    }
+
+    const engine = new TestEngine({
+        pickers: [picker],
+        allSortedCapabilities: ALL_SORTED_CAPABILITIES,
+        segment_name: "test",
+        issuer_id: v4(),
+        ringConfig: {
+            reregister_time_ms: 60_000,
+            token_ack_timeout_ms: 500,
+            skipInitialTokenTimeout: true,
+        },
+        ringStorage: {
+            doTn(callback) {
+                return ringMembershipStore.doTn(txn => {
+                    return callback({
+                        tokenRingRegistration: {
+                            get: async (key) => txn.get(key),
+                            set: (key, value) => txn.set(key, value),
+                            clear: (key) => txn.clear(key),
+                            getRangeAll: async (startKey, endKey, options) => txn.getRangeAll(startKey, endKey, options),
+                        }
+                    })
+                })
+
+            },
+        }
+    })
+
+    return { engine, picker, runners, storage }
 }

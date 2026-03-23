@@ -39,13 +39,13 @@ async function insertPickableTestJob(overrides?: {
         delayMs: overrides?.delayMs ?? 0,
     })
     await storage.doTn(async txn => {
-        txn.set(key, value)
+        txn.job.set(key, value)
     })
     return { key }
 }
 async function getJob(key: WorkflowJobKey) {
     return await storage.doTn(async txn => {
-        return await txn.get(key)
+        return await txn.job.get(key)
     })
 }
 
@@ -75,7 +75,7 @@ describe("picking", async () => {
                 job!.header.execution_id !== undefined || job!.header.at <= 0,
             ).toBe(true)
         } finally {
-            engine.destroy()
+            engine.Destroy()
         }
     })
 
@@ -83,7 +83,7 @@ describe("picking", async () => {
         const key = makeTestJobKey()
         const value = makeTestJobValue({ at: Date.now() + 60_000 })
         await storage.doTn(async txn => {
-            txn.set(key, value)
+            txn.job.set(key, value)
         })
 
         const executorId = `test-future-${v4().slice(0, 8)}`
@@ -103,7 +103,7 @@ describe("picking", async () => {
             expect(job!.header.execution_id).toBeUndefined()
             expect(job!.header.at).toBeGreaterThan(Date.now())
         } finally {
-            engine.destroy()
+            engine.Destroy()
         }
     })
 })

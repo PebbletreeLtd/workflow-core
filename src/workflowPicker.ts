@@ -13,15 +13,14 @@ import {
     type WorkflowJobKey,
     type WorkflowJobValue,
 } from "./workflowTypes"
-import type { atSubspaceKey, WorkflowJobStorage } from "./workflowStorageAdapter"
-import type { WorkflowCapabilities } from "./workflowCapabilities"
+import type { atSubspaceKey, WorkflowStorageTransaction, WorkflowJobStorage } from "./workflowStorageAdapter"
 import { WorkflowCounter } from "./counter"
 
 // =========================================================================
 // Types
 // =========================================================================
 
-export interface PickContext {
+export interface PickContext<PAYLOAD_T extends BasicJobPayload> {
     /** The unique ID of this picking server / executor */
     executorId: string
     /** Average workload across all servers in the ring */
@@ -48,7 +47,9 @@ export interface PickContext {
      * Optional short-circuit: if this returns true the pick is aborted
      * immediately (e.g. graceful shutdown).
      */
-    isTerminating?: () => boolean
+    isTerminating?: () => boolean,
+    canRunType: (type: PAYLOAD_T["type"]) => boolean
+
 }
 
 export interface PickedJob<PAYLOAD_T extends BasicJobPayload> {
@@ -60,23 +61,20 @@ export interface PickedJob<PAYLOAD_T extends BasicJobPayload> {
 // Picker
 // =========================================================================
 
-export interface WorkflowPickerArgs<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> {
-    storage: WorkflowJobStorage<PAYLOAD_T>
-    capabilities: WorkflowCapabilities<PAYLOAD_T>
+export interface WorkflowPickerArgs<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>> {
+    storage: WorkflowJobStorage<PAYLOAD_T, TXN>
     batchSize: number
     idealMaxRunning: number
 }
 
-export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> {
+export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>> {
     /** Exposed so the engine / orchestrator can create JobRunners against the same storage */
-    readonly storage: WorkflowJobStorage<PAYLOAD_T>
-    private readonly capabilities: WorkflowCapabilities<PAYLOAD_T>
+    readonly storage: WorkflowJobStorage<PAYLOAD_T, TXN>
     private readonly batchSize: number
     private readonly idealMaxRunning: number
 
-    constructor(args: WorkflowPickerArgs<PAYLOAD_T>) {
+    constructor(args: WorkflowPickerArgs<PAYLOAD_T, TXN>) {
         this.storage = args.storage
-        this.capabilities = args.capabilities
         this.batchSize = args.batchSize
         this.idealMaxRunning = args.idealMaxRunning
     }
@@ -87,7 +85,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
      * Returns the list of jobs that were successfully adopted. The caller is
      * responsible for actually running them (via JobRunner / WorkflowEngine).
      */
-    async pick(ctx: PickContext): Promise<PickedJob<PAYLOAD_T>[]> {
+    async pick(ctx: PickContext<PAYLOAD_T>): Promise<PickedJob<PAYLOAD_T>[]> {
         try {
             if (ctx.isTerminating?.()) return []
 
@@ -109,13 +107,21 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
                         // The storage adapter uses a snapshot / non-conflicting read
                         // so concurrent inserts don't cause transaction conflicts.
 
-                        const filtered = await this.storage.doTn(async _txn => {
-                            const txn = _txn.at(this.storage.subspaces.at).snapshot();
+                        const filtered = await this.storage.doTn(async txn => {
+
                             const filtered: Array<atSubspaceKey<PAYLOAD_T>> = [];
-                            const candidates = txn.getRange({ at: 1 }, { at: Date.now() });
+                            const candidates = txn.at.getRangeSnapshot({ at: 1 }, { at: Date.now() });
                             for await (const [candidate] of candidates) {
-                                const jobType = candidate.type
-                                if (jobType && this.capabilities.canRunType(jobType)) {
+                                let jobType = candidate.type
+
+                                // If the at-index doesn't carry the type (non-type-indexed storage),
+                                // look up the actual job to determine its type.
+                                if (jobType === undefined) {
+                                    const job = await txn.job.snapshotGet({ job_id: candidate.job_id })
+                                    jobType = job?.payload.type
+                                }
+
+                                if (jobType && ctx.canRunType(jobType)) {
                                     // This server can handle the type — pick it
                                     filtered.push(candidate)
                                 } else if (ctx.ringState && !ctx.ringState.isProvisional) {
@@ -138,7 +144,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
                             filtered.map(async (jobKey) => {
                                 try {
                                     const adopted = await this.storage.doTn(async txn => {
-                                        const job = await txn.get(jobKey)
+                                        const job = await txn.job.get(jobKey)
 
                                         if (!job) return null
                                         if (job.header.at !== jobKey.at) return null // stale — job was modified since scan
@@ -158,7 +164,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
                                                     ...job,
                                                     header: { ...job.header, at: Date.now() + durationSeconds(5) },
                                                 }
-                                                txn.set(jobKey, pushed)
+                                                txn.job.set(jobKey, pushed)
                                                 console.log("Refusing to re-adopt own job. Job configuration issue?", jobKey, "Pushed into the future:", pushed)
                                                 return null
                                             }
@@ -174,7 +180,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
                                                 execution_id: ctx.executorId,
                                             },
                                         }
-                                        txn.set({ job_id: jobKey.job_id }, adopted)
+                                        txn.job.set({ job_id: jobKey.job_id }, adopted)
                                         return adopted
                                     });
 
@@ -230,9 +236,9 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
         let iterEscapeCounter = 1000 // safeguard: at most 50,000 jobs (50 per batch)
 
         while (iterEscapeCounter-- > 0) {
-            const length = await this.storage.doTn(async (_txn) => {
-                const txn = _txn.at(this.storage.subspaces.executor);
-                const jobs: [any, any][] = await txn.getRangeAllStartsWith(
+            const length = await this.storage.doTn(async (txn) => {
+
+                const jobs: [any, any][] = await txn.executor.getRangeAllStartsWith(
                     { execution_id: executorId },
                     { limit: 50 },
                 )
@@ -245,10 +251,10 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
                             "which was running on unresponsive server",
                             executorId,
                         )
-                        const dbTxn = _txn;
-                        const job = await dbTxn.get({ job_id: key.job_id })
+
+                        const job = await txn.job.get({ job_id: key.job_id })
                         if (job) {
-                            dbTxn.set(
+                            txn.job.set(
                                 { job_id: key.job_id },
                                 {
                                     ...job,

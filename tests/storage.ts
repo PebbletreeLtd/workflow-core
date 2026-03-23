@@ -1,27 +1,22 @@
-/**
- * In-memory job storage implementation.
- *
- * A fully functional WorkflowJobStorage backed by @pebbletree/mvcc-testing,
- * suitable for tests and simulated job runners (no external database required).
- */
+
 import type {
     WorkflowJobKey,
     WorkflowJobValue,
     WorkflowJobLogKey,
     WorkflowJobLogValue,
     BasicJobPayload,
-} from "./workflowTypes"
+} from "../src/workflowTypes"
 import * as tuple from "fdb-tuple"
 import type {
     atSubspaceKey,
-    WorkflowStorageTransaction,
     WorkflowJobStorage,
-} from "./workflowStorageAdapter"
+} from "../src/workflowStorageAdapter"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
+import { TransactionFactory } from "@pebbletree/mvcc-testing/dist/types";
 
 
 export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
-    implements WorkflowJobStorage<PAYLOAD_T, WorkflowStorageTransaction<PAYLOAD_T>> {
+    implements WorkflowJobStorage<PAYLOAD_T> {
     readonly JobDatabase = new MVCCCore.Store<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>>({
         keyTransformer: {
             pack(value) {
@@ -49,7 +44,7 @@ export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayl
             return { job_id, timestamp, random }
         }
     }, "logs")
-    readonly atSubspace;
+    readonly atIndex;
     readonly executorIndex = new MVCCCore.DerivedSubspace<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>, { execution_id: string } & WorkflowJobKey, { execution_id: string } & WorkflowJobKey>({
         source: this.JobDatabase,
         mapKey(key, value) {
@@ -68,36 +63,14 @@ export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayl
                 return { execution_id, job_id }
             }
         }
-    });
-    readonly executorSubspace;
-
-    doTn<R>(callback: (txn: WorkflowStorageTransaction<PAYLOAD_T>) => Promise<R>) {
-        return this.JobDatabase.doTransaction(async (txn) => {
-            const sTxn: WorkflowStorageTransaction<PAYLOAD_T> = {
-                job: {
-                    get: async (key) => txn.get(key),
-                    snapshotGet: async (key) => txn.snapshot().get(key),
-                    set: (key, value) => txn.set(key, value),
-                    clear: (key) => txn.clear(key),
-                },
-                jobLogKey: {
-                    set: (key, value) => txn.at(this.JoblogSubpace).set(key, value),
-                },
-                at: {
-                    getRangeSnapshot: (startKey, endKey, options) => txn.snapshot().at(this.atSubspace).getRange(startKey, endKey, options)
-                },
-                executor: {
-                    getRangeAllStartsWith: async (startKey, options) => txn.at(this.executorSubspace).getRangeAllStartsWith(startKey, options)
-                }
-            }
-            return callback(sTxn)
-        })
-    };
+    })
+    readonly doTn: TransactionFactory<WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>>;
+    readonly subspaces: WorkflowJobStorage<PAYLOAD_T>["subspaces"]
     constructor(args: {
         typeIndex: boolean
     }) {
-
-        const atIndex = new MVCCCore.DerivedSubspace<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>, atSubspaceKey<PAYLOAD_T>, atSubspaceKey<PAYLOAD_T>>({
+        this.doTn = this.JobDatabase.doTn.bind(this.JobDatabase);
+        this.atIndex = new MVCCCore.DerivedSubspace<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>, atSubspaceKey<PAYLOAD_T>, atSubspaceKey<PAYLOAD_T>>({
             source: this.JobDatabase,
             mapKey(key, value) {
                 return { at: value.header.at, type: args.typeIndex ? value.payload.type : undefined, job_id: key.job_id }
@@ -126,17 +99,21 @@ export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayl
                 }
             }
         })
-        this.atSubspace = atIndex.withKeyEncoding({
-            unpack: (val) => atIndex.keyXf.unpack(val),
-            pack(value: { at: number }) {
-                return tuple.pack([value.at])
-            },
-        });
-        this.executorSubspace = this.executorIndex.withKeyEncoding({
-            ...this.executorIndex.keyXf,
-            pack(value: { execution_id: string }) {
-                return tuple.pack([value.execution_id])
-            },
-        })
+        this.subspaces = {
+            at: this.atIndex.withKeyEncoding({
+                ...this.atIndex.keyXf,
+                pack(value) {
+                    return tuple.pack([value.at])
+                },
+            }),
+            executor: this.executorIndex.withKeyEncoding({
+                ...this.executorIndex.keyXf,
+                pack(value) {
+                    return tuple.pack(["executor", value.execution_id])
+                },
+            }),
+
+            jobLogKey: this.JoblogSubpace
+        }
     }
 }

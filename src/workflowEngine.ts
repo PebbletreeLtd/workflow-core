@@ -1,10 +1,11 @@
 /**
- * Workflow engine — high-level API that ties pickers, capabilities, and
- * job managers together.
+ * Workflow engine — extends TokenRingWorkDistributor to form a complete
+ * distributed job processing system.
  *
- * The consumer creates an engine, wires its methods to a scheduling mechanism
- * (e.g. token ring's onToken / onServerUnresponsive), and the engine handles
- * the pick → resolve-runner → create-manager → run lifecycle.
+ * On each token receipt the engine picks ready jobs from all configured
+ * pickers, resolves the appropriate runner for each, and executes them.
+ * When the ring detects an unresponsive server, lost jobs are reset
+ * automatically.
  */
 import type {
     BasicJobPayload,
@@ -13,32 +14,44 @@ import type {
     WorkflowJobValue,
 } from "./workflowTypes"
 import { WorkflowPicker, type PickContext } from "./workflowPicker"
-import { WorkflowCapabilities } from "./workflowCapabilities"
-import { JobRunner } from "./jobRunner"
+import { capabilitiesToBuffer, bufferToCapabilities } from "./workflowCapabilities"
+import { JobRunner, type JobRunnerConstructor } from "./jobRunner"
 import { JobError } from "./jobErrors"
 import { WorkflowCounter } from "./counter"
+import {
+    TokenRingWorkDistributor,
+    TokenFlags,
+    type TokenRingConfig,
+    type TokenRingWorkDistributorInterface,
+    type Token,
+    type TokenRingRegistrationKey,
+    type TokenRingRegistrationValue,
+    TokenRingOptions,
+} from "@pebbletree/tokenring"
+import { WorkflowStorageTransaction } from "./workflowStorageAdapter"
 
 // =========================================================================
 // Types
 // =========================================================================
 
-export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload> {
-    pickers: WorkflowPicker<PAYLOAD_T>[]
-    capabilities: WorkflowCapabilities<PAYLOAD_T>
-    /**
-     * Wraps each job's execution. The consumer can add contextual logging,
-     * tracing, or other cross-cutting concerns.
-     *
-     * The `fn` callback must be called exactly once; its return value is the
-     * job outcome.
-     *
-     * Default behaviour: calls `fn()` directly.
-     */
-    runJobWrapper?: (args: {
-        jobKey: WorkflowJobKey
-        payload: PAYLOAD_T
-        fn: () => Promise<WorkflowJobOutcome>
-    }) => Promise<void>
+export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>> {
+    /** One or more pickers, each backed by a different storage table */
+    pickers: WorkflowPicker<PAYLOAD_T, TXN>[]
+    /** All possible job type values, sorted ascending (for bitmap encode/decode) */
+    allSortedCapabilities: PAYLOAD_T["type"][]
+
+    // --- Token ring ---
+    /** Ring segment / namespace */
+    segment_name: string
+    /** Unique identifier for this server */
+    issuer_id: string
+    /** Token ring configuration */
+    ringConfig: TokenRingConfig
+    /** Transaction factory for the ring membership table */
+    ringStorage: TokenRingOptions["storage"]
+
+    // --- Optional ---
+
     /** If set, prints a periodic summary at this interval (ms). */
     summaryIntervalMs?: number
 }
@@ -47,14 +60,87 @@ export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload> {
 // Engine
 // =========================================================================
 
-export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> {
+export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>>
+    extends TokenRingWorkDistributor {
 
-
+    private readonly pickers: WorkflowPicker<PAYLOAD_T, TXN>[]
+    private readonly allSortedCapabilities: PAYLOAD_T["type"][]
     private summaryInterval?: ReturnType<typeof setInterval>
+    protected readonly runners: { [T in PAYLOAD_T["type"]]?: null | undefined | JobRunnerConstructor<PAYLOAD_T, T, TXN> } = {};
 
-    constructor(private options: WorkflowEngineOptions<PAYLOAD_T>) {
+    constructor(options: WorkflowEngineOptions<PAYLOAD_T, TXN>) {
+        super({
+            segment_name: options.segment_name,
+            issuer_id: options.issuer_id,
+            config: options.ringConfig,
+            capabilities: Buffer.alloc(0),
+            storage: options.ringStorage,
+        });
+        this.InitialiseRunners();
+        this.pickers = options.pickers
+        this.allSortedCapabilities = options.allSortedCapabilities
+        // Derive supported capabilities by probing runners (available now that super() has returned)
+        this.args.capabilities = capabilitiesToBuffer(
+            options.allSortedCapabilities.filter(t => !!this.runners[t]),
+            options.allSortedCapabilities,
+        )
         if (options.summaryIntervalMs) {
             this.startSummaryInterval(options.summaryIntervalMs)
+        }
+    }
+    abstract InitialiseRunners(): void;
+    AddRunner<T extends PAYLOAD_T["type"]>(type: T) {
+        return (runner: JobRunnerConstructor<PAYLOAD_T, T, TXN> | null): void => {
+            this.runners[type] = runner
+        }
+    }
+    // ------------------------------------------------------------------
+    // Token ring overrides
+    // ------------------------------------------------------------------
+
+    onToken(ctx: {
+        ring: TokenRingWorkDistributorInterface
+        token: Readonly<Token>
+        done: (workload: { running: number }) => void
+        error: (e: any) => void
+    }): void {
+        const supportedTypes = new Set(
+            bufferToCapabilities(
+                ctx.token.capabilities,
+                this.allSortedCapabilities,
+            ),
+        )
+
+        const pickCtx: Omit<PickContext<PAYLOAD_T>, "canRunType"> = {
+            executorId: this.issuer_id,
+            averageWorkload: ctx.token.averageWorkload,
+            currentRunning: JobRunner.JobRunningCount.total,
+            ringState: {
+                isProvisional: !!(ctx.token.flags & TokenFlags.provisional),
+                supportedTypes,
+            },
+            isTerminating: () => this.destroyed,
+        }
+
+        this.pick(pickCtx)
+            .then(() => {
+                ctx.done({ running: JobRunner.JobRunningCount.total })
+            })
+            .catch((e) => {
+                ctx.error(e)
+            })
+    }
+
+    override async onServerUnresponsive(registration: {
+        key: TokenRingRegistrationKey
+        value: TokenRingRegistrationValue
+    }): Promise<void> {
+        const count = await this.resetLostJobs(registration.value.executor_id)
+        if (count > 0) {
+            console.log(
+                `Reset ${count} lost jobs for unresponsive server`,
+                registration.value.executor_id,
+            )
         }
     }
 
@@ -68,9 +154,13 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
      * Returns the total number of jobs picked. Job execution is fire-and-forget
      * — errors are logged but do not propagate.
      */
-    async pick(ctx: PickContext): Promise<{ pickedJobs: number }> {
+    async pick(_ctx: Omit<PickContext<PAYLOAD_T>, "canRunType">): Promise<{ pickedJobs: number }> {
+        const ctx: PickContext<PAYLOAD_T> = {
+            ..._ctx,
+            canRunType: (type) => !!this.runners[type],
+        }
         const allPicked = await Promise.all(
-            this.options.pickers.map(async (picker) => ({
+            this.pickers.map(async (picker) => ({
                 picker,
                 picked: await picker.pick(ctx),
             })),
@@ -103,15 +193,15 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
     async startJob(args: {
         jobKey: WorkflowJobKey
         job: WorkflowJobValue<PAYLOAD_T>
-        picker: WorkflowPicker<PAYLOAD_T>
+        picker: WorkflowPicker<PAYLOAD_T, TXN>
         executorId: string
     }): Promise<WorkflowJobOutcome> {
         const RunnerClass = (() => {
-            const Cls = this.options.capabilities.getRunner(args.job.payload)
+            const Cls = this.runners[args.job.payload.type as PAYLOAD_T["type"]]
             if (Cls) return Cls
             // Return an error runner so the job goes through the
             // normal retry / fatal-error lifecycle.
-            return class ErrorRunner extends JobRunner<PAYLOAD_T> {
+            return class ErrorRunner extends JobRunner<PAYLOAD_T, any, TXN> {
                 async runJob(): Promise<void | number> {
                     throw new JobError({
                         type: "custom-recoverable",
@@ -124,23 +214,33 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
         const runner = new RunnerClass({
             jobKey: args.jobKey,
             execution_id: args.executorId,
+            type: args.job.payload.type,
             store: args.picker.storage,
         })
+        return this.runJob({
+            jobKey: args.jobKey,
+            payload: args.job.payload,
+            fn: async () => {
+                return await runner.Run()
+            },
+        })
+    }
 
-        if (this.options.runJobWrapper) {
-            let outcome: WorkflowJobOutcome = { type: "success" }
-            await this.options.runJobWrapper({
-                jobKey: args.jobKey,
-                payload: args.job.payload,
-                fn: async () => {
-                    outcome = await runner.Run()
-                    return outcome
-                },
-            })
-            return outcome
-        }
-
-        return runner.Run()
+    /**
+         * Wraps each job's execution. The consumer can add contextual logging,
+         * tracing, or other cross-cutting concerns.
+         *
+         * The `fn` callback must be called exactly once; its return value is the
+         * job outcome.
+         *
+         * Default behaviour: calls `fn()` directly.
+         */
+    runJob(args: {
+        jobKey: WorkflowJobKey
+        payload: PAYLOAD_T
+        fn: () => Promise<WorkflowJobOutcome>
+    }): Promise<WorkflowJobOutcome> {
+        return args.fn()
     }
 
     /**
@@ -149,15 +249,16 @@ export class WorkflowEngine<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
      */
     async resetLostJobs(executorId: string): Promise<number> {
         let total = 0
-        for (const picker of this.options.pickers) {
+        for (const picker of this.pickers) {
             total += await picker.resetLostJobs(executorId)
         }
         return total
     }
 
-    /** Stop the summary interval and clean up. */
-    destroy(): void {
+    /** Stop the summary interval and destroy the ring. */
+    override Destroy(cause?: any): void {
         if (this.summaryInterval) clearInterval(this.summaryInterval)
+        super.Destroy(cause)
     }
 
     // ------------------------------------------------------------------

@@ -21,7 +21,7 @@ import {
     type TestPayload,
 } from "./harness"
 import { SimulatedJobRunner } from "../src/simulatedJobRunner"
-import type { WorkflowJobStorage } from "../src/workflowStorageAdapter"
+import type { WorkflowStorageTransaction, WorkflowJobStorage } from "../src/workflowStorageAdapter"
 
 // Helper to create a TestJobRunner with simulated storage
 function setupJobRunner(overrides?: Parameters<typeof makeTestJobValue>[0]) {
@@ -30,9 +30,9 @@ function setupJobRunner(overrides?: Parameters<typeof makeTestJobValue>[0]) {
     return { runner, key: runner.jobKey, storage: runner.store }
 }
 
-async function getJob(storage: WorkflowJobStorage<TestPayload>, key: WorkflowJobKey) {
+async function getJob(storage: WorkflowJobStorage<TestPayload, WorkflowStorageTransaction<TestPayload>>, key: WorkflowJobKey) {
     return await storage.doTn(async txn => {
-        return await txn.get(key)
+        return await txn.job.get(key)
     })
 }
 // --- Successful completion ---
@@ -122,7 +122,7 @@ describe("lifecycle", () => {
         const value = makeTestJobValue()
 
         /** A runner that just calls Progress to force a fresh DB read */
-        class ProgressOnlyRunner extends SimulatedJobRunner<TestPayload> {
+        class ProgressOnlyRunner extends SimulatedJobRunner<TestPayload, "_test"> {
             async runJob() { await this.Progress() }
         }
 
@@ -131,7 +131,7 @@ describe("lifecycle", () => {
 
         // Delete the job before running the runner body
         await runner.store.doTn(async txn => {
-            txn.clear(runner.jobKey)
+            txn.job.clear(runner.jobKey)
         })
 
         const outcome = await runner.Run()
@@ -145,7 +145,7 @@ describe("lifecycle", () => {
         const value = makeTestJobValue()
 
         /** A runner that just calls Progress to trigger readoption detection */
-        class ProgressOnlyRunner extends SimulatedJobRunner<TestPayload> {
+        class ProgressOnlyRunner extends SimulatedJobRunner<TestPayload, "_test"> {
             async runJob() { await this.Progress() }
         }
 
@@ -155,11 +155,11 @@ describe("lifecycle", () => {
         // Simulate another server adopting the job
         const otherExecId = v4()
         await runner.store.doTn(async txn => {
-            const job = await txn.get(runner.jobKey)
+            const job = await txn.job.get(runner.jobKey)
             if (!job) {
                 throw new Error("Job not found for readopted test")
             }
-            txn.set(runner.jobKey, {
+            txn.job.set(runner.jobKey, {
                 ...job,
                 header: { ...job.header, execution_id: otherExecId },
             })
@@ -180,9 +180,9 @@ describe("lifecycle", () => {
         await runner.Run()
 
         // Check that a log entry was written for this job
-        const matchingLog = await storage.doTn(async _txn => {
-            const txn = _txn.at(storage.subspaces.jobLogKey)
-            const range = txn.getRange({
+        const matchingLog = await runner.memoryStore.JobDatabase.doTn(async txn => {
+
+            const range = txn.at(runner.memoryStore.JoblogSubpace).getRange({
                 timestamp: 0,
                 job_id: "",
                 random: ""

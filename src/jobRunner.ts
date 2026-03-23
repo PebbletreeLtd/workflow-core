@@ -21,28 +21,28 @@ import { durationMinutes } from "./workflowTypes"
 import { JobError } from "./jobErrors"
 import { computeNextSchedule } from "./schedule"
 import { WorkflowCounter } from "./counter"
-import { MVCCCore } from "@pebbletree/mvcc-testing"
-import { WorkflowJobStorage } from "./workflowStorageAdapter"
+import { WorkflowStorageTransaction, WorkflowJobStorage } from "./workflowStorageAdapter"
 import { v4 } from "uuid"
 
-export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
+export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T> = WorkflowStorageTransaction<PAYLOAD_T>> {
     jobKey: Readonly<WorkflowJobKey>
     execution_id: string,
-    store: WorkflowJobStorage<PAYLOAD_T>
+    store: WorkflowJobStorage<PAYLOAD_T, TXN>
     /**
      * Optional promise that must resolve before the first store read.
      * Used by SimulatedJobRunner to ensure the seed transaction commits first.
      */
-    ready?: Promise<unknown>
+    ready?: Promise<unknown>,
+    type: T
 }
 
 /** Constructor type for a concrete JobRunner subclass. */
-export type JobRunnerConstructor<PAYLOAD_T extends BasicJobPayload> =
-    { new(args: JobRunnerOptions<PAYLOAD_T>): JobRunner<PAYLOAD_T> }
+export type JobRunnerConstructor<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>> =
+    { new(args: JobRunnerOptions<PAYLOAD_T, T, TXN>): JobRunner<PAYLOAD_T, T, TXN> }
 
 
 
-export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
+export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>> {
     readonly outofProcessError = (() => {
         let callback: any = undefined
         const promise = new Promise<void>((_, E) => {
@@ -57,18 +57,18 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
     private startTime = Date.now()
     private static readonly runningJobs = new Map<string, number>()
     private static totalRunningJobs = 0
-    private _store: WorkflowJobStorage<PAYLOAD_T>
+    private _store: WorkflowJobStorage<PAYLOAD_T, TXN>
     private _job: Promise<{
         header: Readonly<WorkflowJobHeader>
-        payload: PAYLOAD_T
-        for_userspace_id: string | null
+        payload: PAYLOAD_T & { type: T }
     }> | undefined
     private readonly execution_id: string
     private readonly _ready: Promise<unknown> | undefined
+    readonly jobType: T
     readonly jobKey: Readonly<WorkflowJobKey>
 
     /** The storage adapter backing this runner. */
-    get store(): WorkflowJobStorage<PAYLOAD_T> { return this._store }
+    get store(): WorkflowJobStorage<PAYLOAD_T, TXN> { return this._store }
 
     /**
      * Resolves once any setup work (e.g. seed transactions) is complete.
@@ -76,13 +76,13 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
      */
     async whenReady(): Promise<void> { if (this._ready) await this._ready }
 
-    constructor(args: JobRunnerOptions<PAYLOAD_T>) {
+    constructor(args: JobRunnerOptions<PAYLOAD_T, T, TXN>) {
         this.execution_id = args.execution_id
         this.jobKey = args.jobKey
         this._store = args.store
         this._ready = args.ready
+        this.jobType = args.type
     }
-
     /**
      * Implement this method to define the actual work for this job type.
      * Has full access to the runner via `this` — call `this.GetJob()`,
@@ -110,23 +110,24 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
     }
 
     private async GetUpdatedJob(
-        txn?: MVCCCore.ITransaction<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>>
+        txn?: TXN
     ): Promise<{
         header: Readonly<WorkflowJobHeader>
-        payload: PAYLOAD_T
-        for_userspace_id: string | null,
+        payload: PAYLOAD_T & { type: T }
     }> {
         if (!txn) {
             if (this._ready) await this._ready
             return this._store.doTn(txn => this.GetUpdatedJob(txn))
         }
-        const job = await txn.get(this.jobKey)
+        const job = await txn.job.get(this.jobKey)
         if (!job) {
             throw new JobError({ type: "vanished" })
         } else if (job.header.execution_id !== this.execution_id) {
             throw new JobError({ type: "readopted", by: job.header.execution_id || "undefined" })
+        } else if (job.payload.type !== this.jobType) {
+            throw new Error(`Job payload type mismatch: expected ${this.jobType} but got ${job.payload.type}`)
         }
-        return { ...job }
+        return { ...job, payload: { ...job.payload, type: this.jobType } }
     }
 
     async GetJob() {
@@ -152,7 +153,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
             if (options.progress || !amended.header.last_progress) {
                 amended.header.last_progress = Date.now()
             }
-            txn.set(this.jobKey, amended)
+            txn.job.set(this.jobKey, amended)
             return amended
         })
         const job = await this.GetJob()
@@ -184,7 +185,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
         if (this.pushbackTimer) clearTimeout(this.pushbackTimer)
     }
 
-    async Progress(payload?: Partial<PAYLOAD_T>) {
+    async Progress(payload?: Partial<PAYLOAD_T & { type: T }>) {
         return this.ResetJob({ progress: true, payload })
     }
 
@@ -213,21 +214,24 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
                 // Success path: clear/reschedule + post-processing in one transaction
                 return await this._store.doTn(async (txn) => {
                     let outcome: WorkflowJobOutcome = { type: "success" }
-                    const job = await txn.get(this.jobKey)
+                    const job = await txn.job.get(this.jobKey)
                     if (!job || job.header.execution_id !== this.execution_id) {
                         return outcome
                     }
                     // Post-processing hook (storage adapter's case statement)
-                    outcome = await this.onJobOutcome({
-                        outcome,
-                        payload: job.payload,
-                        jobKey: this.jobKey,
-                        txn
-                    })
+                    if (job.payload.type === this.jobType)
+                        outcome = await this.onJobOutcome({
+                            outcome,
+                            payload: {
+                                ...job.payload, type: this.jobType
+                            },
+                            jobKey: this.jobKey,
+                            txn
+                        })
 
                     if (result) {
                         // Runner returned a future timestamp — reschedule
-                        txn.set(this.jobKey, {
+                        txn.job.set(this.jobKey, {
                             ...job,
                             header: { ...job.header, at: result, execution_id: undefined },
                         })
@@ -236,12 +240,12 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
                         const next_schedule = computeNextSchedule(job.header)
                         if (next_schedule) {
                             console.debug("Rescheduling job for", next_schedule)
-                            txn.set(this.jobKey, {
+                            txn.job.set(this.jobKey, {
                                 ...job,
                                 header: { ...job.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined },
                             })
                         } else {
-                            txn.set(this.jobKey, {
+                            txn.job.set(this.jobKey, {
                                 ...job,
                                 header: { ...job.header, at: 0 - Math.abs(job.header.at), execution_id: undefined },
                             })
@@ -262,14 +266,14 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
 
                 // Handle error within a transactional context
                 return await this._store.doTn(async (txn) => {
-                    const currentJob = await txn.get(this.jobKey)
+                    const currentJob = await txn.job.get(this.jobKey)
                     if (!currentJob) return { type: "vanished" } as WorkflowJobOutcome
 
                     let outcome = await (async (): Promise<WorkflowJobOutcome> => {
                         switch (err.type) {
                             case "vanished":
                                 // Clear the job
-                                txn.set(this.jobKey, {
+                                txn.job.set(this.jobKey, {
                                     ...currentJob,
                                     header: { ...currentJob.header, at: 0 - Math.abs(currentJob.header.at), execution_id: undefined }
                                 })
@@ -282,18 +286,18 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
                                     currentJob.header.at = Date.now() + currentJob.header.retries.initial_backoff_ms
                                     currentJob.header.retries.initial_backoff_ms *= currentJob.header.retries.exponent
                                     currentJob.header.execution_id = undefined
-                                    txn.set(this.jobKey, currentJob)
+                                    txn.job.set(this.jobKey, currentJob)
                                     return { type: "rescheduled-error", cause: err as any }
                                 } else {
                                     // Clear via schedule or negate at
                                     const next_schedule = computeNextSchedule(currentJob.header)
                                     if (next_schedule) {
-                                        txn.set(this.jobKey, {
+                                        txn.job.set(this.jobKey, {
                                             ...currentJob,
                                             header: { ...currentJob.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined }
                                         })
                                     } else {
-                                        txn.set(this.jobKey, {
+                                        txn.job.set(this.jobKey, {
                                             ...currentJob,
                                             header: { ...currentJob.header, at: 0 - Math.abs(currentJob.header.at), execution_id: undefined }
                                         })
@@ -306,12 +310,12 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
                                 // Clear via schedule or negate at
                                 const next_schedule = computeNextSchedule(currentJob.header)
                                 if (next_schedule) {
-                                    txn.set(this.jobKey, {
+                                    txn.job.set(this.jobKey, {
                                         ...currentJob,
                                         header: { ...currentJob.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined }
                                     })
                                 } else {
-                                    txn.set(this.jobKey, {
+                                    txn.job.set(this.jobKey, {
                                         ...currentJob,
                                         header: { ...currentJob.header, at: 0 - Math.abs(currentJob.header.at), execution_id: undefined }
                                     })
@@ -324,9 +328,10 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
                     await this.WriteJobLog(txn, outcome)
 
                     // Post-processing hook (storage adapter's case statement)
-                    outcome = await this.onJobOutcome({
-                        outcome, payload: currentJob.payload, jobKey: this.jobKey, txn
-                    })
+                    if (currentJob.payload.type === this.jobType)
+                        outcome = await this.onJobOutcome({
+                            outcome, payload: { ...currentJob.payload, type: this.jobType }, jobKey: this.jobKey, txn
+                        })
 
                     // Notify on fatal errors via callback
                     switch (outcome.type) {
@@ -380,13 +385,13 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
 
     /**Override if to implement customize job log writing */
     async WriteJobLog(
-        txn: MVCCCore.ITransaction<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>>,
+        txn: TXN,
         outcome: WorkflowJobOutcome
     ) {
-        const logTxn = txn.at(this._store.subspaces.jobLogKey)
-        logTxn.set(
+
+        txn.jobLogKey.set(
             { timestamp: Date.now(), job_id: this.jobKey.job_id, random: v4() },
-            { outcome }
+            { at: Date.now(), execution_id: this.execution_id, outcome }
         )
     }    /**
      * Called on fatal / vanished / rescheduled-error outcomes so the implementer
@@ -404,9 +409,9 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload> {
      * Returns the outcome unchanged by default. */
     async onJobOutcome(args: {
         outcome: WorkflowJobOutcome
-        payload: PAYLOAD_T
+        payload: PAYLOAD_T & { type: T }
         jobKey: WorkflowJobKey,
-        txn: Pick<MVCCCore.ITransaction<unknown, unknown, unknown, unknown>, "at">
+        txn: TXN
     }): Promise<WorkflowJobOutcome> { return args.outcome }
 }
 

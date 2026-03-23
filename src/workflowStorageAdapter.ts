@@ -1,4 +1,3 @@
-import { MVCCCore } from "@pebbletree/mvcc-testing"
 /**
  * Workflow job storage adapter interface.
  * 
@@ -13,10 +12,10 @@ import { MVCCCore } from "@pebbletree/mvcc-testing"
  */
 import type {
     WorkflowJobKey,
-    WorkflowJobValue,
     BasicJobPayload,
     WorkflowJobLogKey,
     WorkflowJobLogValue,
+    WorkflowJobValue,
 } from "./workflowTypes"
 
 // =========================================================================
@@ -25,14 +24,30 @@ import type {
 
 
 export type atSubspaceKey<PAYLOAD_T extends BasicJobPayload> = { at: number, type?: PAYLOAD_T["type"] } & WorkflowJobKey
-export interface WorkflowJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> {
-    doTn: MVCCCore.TransactionFactory<WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>>
+
+
+export interface WorkflowStorageTransaction<PAYLOAD_T extends BasicJobPayload> {
+    job: {
+        get: (key: WorkflowJobKey) => Promise<WorkflowJobValue<PAYLOAD_T> | undefined>
+        snapshotGet: (key: WorkflowJobKey) => Promise<WorkflowJobValue<PAYLOAD_T> | undefined>
+        set: (key: WorkflowJobKey, value: WorkflowJobValue<PAYLOAD_T>) => void
+        clear: (key: WorkflowJobKey) => void
+    },
+    jobLogKey: {
+        set: (key: WorkflowJobLogKey, value: WorkflowJobLogValue) => void
+    },
+    at: {
+        getRangeSnapshot: (startKey: { at: number }, endKey: { at: number }, options?: { limit?: number; reverse?: boolean }) => AsyncGenerator<[atSubspaceKey<PAYLOAD_T>, unknown]> // snapshot read of the "at" index
+    },
+    executor: {
+        getRangeAllStartsWith: (startKey: { execution_id: string }, options?: { limit?: number; reverse?: boolean }) => Promise<Array<[{ execution_id: string }, unknown]>>,
+    },
+}
+
+
+export interface WorkflowJobStorage<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>> {
     /**
      * Used to retrieve ready jobs for picking. The engine scans by the `at` index
      */
-    subspaces: {
-        at: MVCCCore.ISubspace<{ at: number }, atSubspaceKey<PAYLOAD_T>, never, unknown>,
-        jobLogKey: MVCCCore.ISubspace<WorkflowJobLogKey, WorkflowJobLogKey, unknown, WorkflowJobLogValue>,
-        executor: MVCCCore.ISubspace<{ execution_id: string }, WorkflowJobKey, never, unknown>,
-    }
+    doTn: <R>(callback: (txn: TXN) => Promise<R>) => Promise<R>
 }

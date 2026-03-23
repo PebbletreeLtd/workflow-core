@@ -28,6 +28,7 @@ export type {
     WorkflowJobLogOutcome,
     WorkflowJobLogKey,
     WorkflowJobLogValue,
+
 } from "./workflowTypes"
 
 export {
@@ -41,10 +42,11 @@ export {
 // Storage adapter
 export type {
     WorkflowJobStorage,
+    WorkflowStorageTransaction
 } from "./workflowStorageAdapter"
 
-// Capabilities
-export { WorkflowCapabilities } from "./workflowCapabilities"
+// Capability bitmap utilities
+export { capabilitiesToBuffer, bufferToCapabilities, mergeCapabilityBuffers } from "./workflowCapabilities"
 
 // Counter / metrics
 export { WorkflowCounter } from "./counter"
@@ -64,9 +66,24 @@ export type { JobRunnerOptions, JobRunnerConstructor } from "./jobRunner"
 export { WorkflowPicker } from "./workflowPicker"
 export type { PickContext, PickedJob, WorkflowPickerArgs } from "./workflowPicker"
 
-// Engine (orchestrator)
+// Engine (orchestrator + token ring)
 export { WorkflowEngine } from "./workflowEngine"
 export type { WorkflowEngineOptions } from "./workflowEngine"
+
+// Re-export token ring types consumers need
+export {
+    TokenRingWorkDistributor,
+    TokenFlags,
+    InMemoryTransport,
+} from "@pebbletree/tokenring"
+export type {
+    TokenRingConfig,
+    TokenRingRegistrationKey,
+    TokenRingRegistrationValue,
+    TokenRingTransport,
+    Token,
+    TokenRingWorkDistributorInterface,
+} from "@pebbletree/tokenring"
 
 
 // Simulated (in-memory) job runner for testing
@@ -75,3 +92,4 @@ export type { SimulatedJobRunnerOptions } from "./simulatedJobRunner"
 
 // In-memory storage
 export { InMemoryJobStorage } from "./inMemoryStorage"
+export * as WorkflowUtils from "./utils"

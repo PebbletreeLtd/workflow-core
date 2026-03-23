@@ -126,10 +126,9 @@ export interface BasicJobPayload {
     type: string
 }
 
-export type WorkflowJobValue<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> = {
+export type WorkflowJobValue<PAYLOAD_T extends BasicJobPayload> = {
     payload: PAYLOAD_T
     header: WorkflowJobHeader
-    for_userspace_id: string | null
 }
 
 // =========================================================================
