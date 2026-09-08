@@ -102,9 +102,9 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
             return Date.now() + duration
         const deadline = (await this.GetJob()).header.progress_deadline_ms / 2
         const progress = duration > deadline / 2
-            ? setInterval(() => { this.Progress() }, deadline / 2)
+            ? setInterval(() => { this.Progress() }, deadline / 2).unref()
             : undefined
-        await new Promise(r => setTimeout(r, duration))
+        await new Promise(r => setTimeout(r, duration).unref())
         if (progress) clearInterval(progress)
         return undefined
     }
@@ -170,14 +170,14 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
             } catch (e) {
                 this.outofProcessError.raise(e)
             }
-        }, duration)
+        }, duration).unref()
     }
 
     private ResetProgressTimer(duration: number) {
         if (this.progressTimer) clearTimeout(this.progressTimer)
         this.progressTimer = setTimeout(async () => {
             this.outofProcessError.raise(new JobError({ type: "progress-deadline" }))
-        }, duration)
+        }, duration).unref()
     }
 
     private clearTimers() {
@@ -265,7 +265,8 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
 
 
                 // Handle error within a transactional context
-                return await this._store.doTn(async (txn) => {
+                let onFatalErrorCallback: (() => void) | undefined = undefined as (() => void) | undefined
+                const ret = await this._store.doTn(async (txn) => {
                     const currentJob = await txn.job.get(this.jobKey)
                     if (!currentJob) return { type: "vanished" } as WorkflowJobOutcome
 
@@ -348,7 +349,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                             ) break
                             if (currentJob.payload.type !== "scheduled_email") {
                                 // Fire and forget — don't let email failures affect the outcome
-                                this.onFatalError({
+                                onFatalErrorCallback = () => this.onFatalError({
                                     job: currentJob,
                                     jobKey: this.jobKey,
                                     outcome,
@@ -359,7 +360,11 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                             outcome.type satisfies "readopted" | "rescheduled-error" | "success"
                     }
                     return outcome
-                })
+                });
+                if (onFatalErrorCallback) {
+                    onFatalErrorCallback();
+                }
+                return ret;
             }
         })()
 

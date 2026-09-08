@@ -113,11 +113,11 @@ export class TestJobRunner extends SimulatedJobRunner<TestPayload, "_test"> {
             if (progressInterval && progressInterval > 0) {
                 const steps = Math.ceil(delayMs / progressInterval)
                 for (let i = 0; i < steps; i++) {
-                    await new Promise(r => setTimeout(r, progressInterval))
+                    await new Promise(r => setTimeout(r, progressInterval).unref())
                     await this.Progress()
                 }
             } else {
-                await new Promise(r => setTimeout(r, delayMs))
+                await new Promise(r => setTimeout(r, delayMs).unref())
             }
         }
 

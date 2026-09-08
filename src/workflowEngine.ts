@@ -276,6 +276,6 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
                     }),
                 )
             } catch { /* swallow — summary is best-effort */ }
-        }, ms)
+        }, ms).unref()
     }
 }
