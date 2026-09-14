@@ -6,7 +6,7 @@
  * of a real JobRunner but backed entirely by in-memory storage.
  */
 import type { BasicJobPayload, WorkflowJobKey, WorkflowJobValue } from "./workflowTypes"
-import { JobRunner } from "./jobRunner"
+import { JobRunner, type JobRunnerOptions } from "./jobRunner"
 import { InMemoryJobStorage } from "./inMemoryStorage"
 import { v4 } from "uuid"
 import { WorkflowStorageTransaction } from "./workflowStorageAdapter"
@@ -23,8 +23,16 @@ export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
 }
 
 export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"]> extends JobRunner<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>> {
-    readonly memoryStore;
-    constructor(options: SimulatedJobRunnerOptions<PAYLOAD_T>) {
+    readonly memoryStore: InMemoryJobStorage<PAYLOAD_T>
+    // Supports both test-driven instantiation (with `job` for auto-seeding)
+    // and engine-driven instantiation as a JobRunnerConstructor (job already
+    // in the shared store).
+    constructor(options: SimulatedJobRunnerOptions<PAYLOAD_T> | JobRunnerOptions<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>>) {
+        if (!("job" in options)) {
+            super(options)
+            this.memoryStore = options.store as InMemoryJobStorage<PAYLOAD_T>
+            return
+        }
         const storage = options.store ?? new InMemoryJobStorage<PAYLOAD_T>({
             typeIndex: options.typeIndex ?? false,
         })
