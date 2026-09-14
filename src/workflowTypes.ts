@@ -102,6 +102,13 @@ export interface WorkflowRetryPolicy {
     max: number
     initial_backoff_ms: number
     exponent: number
+    /**
+     * Snapshot of the original `max` and `initial_backoff_ms`, captured the
+     * first time a retry is consumed. Used to restore the retry budget when a
+     * repeating job successfully reschedules. Managed by the runner — do not
+     * set manually.
+     */
+    _initial?: { max: number, initial_backoff_ms: number }
 }
 
 // =========================================================================

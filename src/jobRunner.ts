@@ -16,6 +16,7 @@ import type {
     WorkflowJobValue,
     WorkflowJobOutcome,
     WorkflowJobError,
+    WorkflowRetryPolicy,
 } from "./workflowTypes"
 import { durationMinutes } from "./workflowTypes"
 import { JobError } from "./jobErrors"
@@ -23,6 +24,14 @@ import { computeNextSchedule } from "./schedule"
 import { WorkflowCounter } from "./counter"
 import { WorkflowStorageTransaction, WorkflowJobStorage } from "./workflowStorageAdapter"
 import { v4 } from "uuid"
+
+/** If a snapshot of the initial retry policy exists, return a fresh policy
+ * with the original `max` and `initial_backoff_ms` restored. */
+function restoreRetriesOnSuccess(retries: WorkflowRetryPolicy): WorkflowRetryPolicy {
+    if (!retries._initial) return retries
+    const { _initial, ...rest } = retries
+    return { ...rest, max: _initial.max, initial_backoff_ms: _initial.initial_backoff_ms }
+}
 
 export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T> = WorkflowStorageTransaction<PAYLOAD_T>> {
     jobKey: Readonly<WorkflowJobKey>
@@ -240,9 +249,10 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                         const next_schedule = computeNextSchedule(job.header)
                         if (next_schedule) {
                             console.debug("Rescheduling job for", next_schedule)
+                            const retries = restoreRetriesOnSuccess(job.header.retries)
                             txn.job.set(this.jobKey, {
                                 ...job,
-                                header: { ...job.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, execution_id: undefined },
+                                header: { ...job.header, at: next_schedule.nextDate, repeatSchedule: next_schedule, retries, execution_id: undefined },
                             })
                         } else {
                             txn.job.set(this.jobKey, {
@@ -283,6 +293,12 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                             case "progress-deadline":
                             case "payloadMismatch":
                                 if (currentJob.header.retries.max > 0) {
+                                    if (!currentJob.header.retries._initial) {
+                                        currentJob.header.retries._initial = {
+                                            max: currentJob.header.retries.max,
+                                            initial_backoff_ms: currentJob.header.retries.initial_backoff_ms,
+                                        }
+                                    }
                                     currentJob.header.retries.max--
                                     currentJob.header.at = Date.now() + currentJob.header.retries.initial_backoff_ms
                                     currentJob.header.retries.initial_backoff_ms *= currentJob.header.retries.exponent

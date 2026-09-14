@@ -15,32 +15,32 @@ export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
     jobKey?: WorkflowJobKey
     job: WorkflowJobValue<PAYLOAD_T>
     typeIndex?: boolean
-    /** Provide a shared store instead of creating a fresh one per runner. */
+    /** Provide a shared store instead of creating a fresh one per runner.
+     * When set, an existing job at `jobKey` is preserved (only the payload is
+     * refreshed and a new `execution_id` is stamped) so retry state, backoff,
+     * and snapshots carry across successive runs. */
+    store?: InMemoryJobStorage<PAYLOAD_T>
 }
 
 export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"]> extends JobRunner<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>> {
     readonly memoryStore;
     constructor(options: SimulatedJobRunnerOptions<PAYLOAD_T>) {
-        const storage = new InMemoryJobStorage<PAYLOAD_T>({
+        const storage = options.store ?? new InMemoryJobStorage<PAYLOAD_T>({
             typeIndex: options.typeIndex ?? false,
         })
         const jobKey = options.jobKey ?? { job_id: v4() }
         const execution_id = v4()
 
-        // Seed the job into the in-memory store synchronously via a transaction
-        // that resolves before super() needs it.
-        const job = {
-            ...options.job,
-            header: {
-                ...options.job.header,
-                execution_id,
-            },
-        }
-        // We need to insert the job before the base class constructor reads it.
-        // MVCCCore.Store.doTn is synchronous-start so we kick it off and let
-        // the base class's GetUpdatedJob() await it naturally.
-        const seedPromise = storage.doTn(async txn => { txn.job.set(jobKey, job) })
-        super({ jobKey, execution_id, store: storage, ready: seedPromise, type: job.payload.type as T })
+        const seedPromise = storage.doTn(async txn => {
+            const existing = await txn.job.get(jobKey)
+            const base = existing ?? options.job
+            txn.job.set(jobKey, {
+                ...base,
+                payload: options.job.payload,
+                header: { ...base.header, execution_id },
+            })
+        })
+        super({ jobKey, execution_id, store: storage, ready: seedPromise, type: options.job.payload.type as T })
         this.memoryStore = storage
     }
 }

@@ -200,4 +200,46 @@ describe("lifecycle", () => {
 
         expect(matchingLog).toBeDefined()
     })
+
+    // --- Retry policy reset on success ---
+
+    it("restores retry policy on next scheduled run after a successful attempt", async () => {
+        // Run 1: fail once, consuming a retry.
+        const first = setupJobRunner({
+            shouldFail: true,
+            failType: "recoverable",
+            retries: { max: 3, initial_backoff_ms: 100, exponent: 2 },
+            repeatSchedule: {
+                type: "periodic",
+                unit: "minutes",
+                period: 1,
+                nextDate: Date.now(),
+                until: { format: "forever" },
+            },
+        })
+        const outcome1 = await first.runner.Run()
+        expect(outcome1.type).toBe("rescheduled-error")
+
+        const afterFail = await getJob(first.storage, first.key)
+        expect(afterFail!.header.retries.max).toBe(2)
+        expect(afterFail!.header.retries.initial_backoff_ms).toBe(200)
+
+        // Run 2: same job in the same store, this time succeeds.
+        const succeedingPayload = makeTestJobValue({ shouldFail: false })
+        const runner2 = new TestJobRunner({
+            store: first.runner.memoryStore,
+            jobKey: first.key,
+            job: succeedingPayload,
+        })
+        const outcome2 = await runner2.Run()
+        expect(outcome2.type).toBe("success")
+
+        const afterSuccess = await getJob(first.storage, first.key)
+        expect(afterSuccess).not.toBeNull()
+        // Rescheduled to next occurrence…
+        expect(afterSuccess!.header.at).toBeGreaterThan(Date.now())
+        // …with the retry budget fully restored.
+        expect(afterSuccess!.header.retries.max).toBe(3)
+        expect(afterSuccess!.header.retries.initial_backoff_ms).toBe(100)
+    })
 })
