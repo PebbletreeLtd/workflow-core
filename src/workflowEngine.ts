@@ -35,7 +35,7 @@ import { defaultWorkflowClock, WorkflowClock, WorkflowClockTimerCancel } from ".
 // Types
 // =========================================================================
 
-export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>> {
+export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>, CTX = never> {
     /** One or more pickers, each backed by a different storage table */
     pickers: WorkflowPicker<PAYLOAD_T, TXN>[]
     /** All possible job type values, sorted ascending (for bitmap encode/decode) */
@@ -50,6 +50,8 @@ export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN ex
     ringConfig: TokenRingConfig
     /** Transaction factory for the ring membership table */
     ringStorage: TokenRingOptions["storage"]
+    /** Optional context for this engine instance. */
+    ctx?: CTX
 
     // --- Optional ---
 
@@ -63,7 +65,7 @@ export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN ex
 // Engine
 // =========================================================================
 
-export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>>
+export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>, CTX = never>
     extends TokenRingWorkDistributor {
     private namedCounters = new Map<string, WorkflowCounter>()
     private readonly pickers: WorkflowPicker<PAYLOAD_T, TXN>[]
@@ -71,7 +73,8 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
     private summaryInterval?: WorkflowClockTimerCancel
     protected readonly runners: { [T in PAYLOAD_T["type"]]?: null | undefined | JobRunnerConstructor<PAYLOAD_T, T, TXN> } = {};
     readonly clock: WorkflowClock
-    constructor(options: WorkflowEngineOptions<PAYLOAD_T, TXN>) {
+    readonly ctx: CTX
+    constructor(options: WorkflowEngineOptions<PAYLOAD_T, TXN, CTX>) {
         super({
             segment_name: options.segment_name,
             issuer_id: options.issuer_id,
@@ -91,11 +94,12 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
         if (options.summaryIntervalMs) {
             this.startSummaryInterval(options.summaryIntervalMs)
         }
+        this.ctx = options.ctx || {} as CTX
     }
     abstract InitialiseRunners(): void;
     AddRunner<T extends PAYLOAD_T["type"]>(type: T) {
-        return (runner: JobRunnerConstructor<PAYLOAD_T, T, TXN> | null): void => {
-            this.runners[type] = runner
+        return (runner: JobRunnerConstructor<PAYLOAD_T, T, TXN, CTX> | null): void => {
+            this.runners[type] = runner as any
         }
     }
     // ------------------------------------------------------------------
@@ -224,6 +228,7 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             store: args.picker.storage,
             clock: this.clock,
             pegCounterValue: (value) => this.pegCounterValue(value),
+            context: this.ctx as never,
         })
         return this.runJob({
             jobKey: args.jobKey,

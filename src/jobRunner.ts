@@ -33,7 +33,7 @@ function restoreRetriesOnSuccess(retries: WorkflowRetryPolicy): WorkflowRetryPol
     return { ...rest, max: _initial.max, initial_backoff_ms: _initial.initial_backoff_ms }
 }
 
-export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T> = WorkflowStorageTransaction<PAYLOAD_T>> {
+export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T> = WorkflowStorageTransaction<PAYLOAD_T>, CTX = never> {
     jobKey: Readonly<WorkflowJobKey>
     execution_id: string,
     store: WorkflowJobStorage<PAYLOAD_T, TXN>
@@ -44,16 +44,18 @@ export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends P
     ready?: Promise<unknown>,
     type: T,
     clock: WorkflowClock,
-    pegCounterValue: (value: Partial<iWorkflowCounter>) => void
+    pegCounterValue: (value: Partial<iWorkflowCounter>) => void,
+    context: CTX
 }
 
 /** Constructor type for a concrete JobRunner subclass. */
-export type JobRunnerConstructor<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>> =
-    { new(args: JobRunnerOptions<PAYLOAD_T, T, TXN>): JobRunner<PAYLOAD_T, T, TXN> }
+export type JobRunnerConstructor<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>, CTX = never> =
+    { new(args: JobRunnerOptions<PAYLOAD_T, T, TXN, CTX>): JobRunner<PAYLOAD_T, T, TXN, CTX> }
 
 
 
-export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>> {
+export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>, CTX = never> {
+    readonly context: CTX
     readonly outofProcessError = (() => {
         let callback: any = undefined
         const promise = new Promise<void>((_, E) => {
@@ -98,6 +100,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         this.clock = args.clock
         this.startTime = this.clock.now()
         this.pegCounterValue = args.pegCounterValue
+        this.context = args.context
     }
     /**
      * Implement this method to define the actual work for this job type.

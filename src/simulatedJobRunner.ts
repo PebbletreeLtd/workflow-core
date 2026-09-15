@@ -12,7 +12,7 @@ import { v4 } from "uuid"
 import { WorkflowStorageTransaction } from "./workflowStorageAdapter"
 import { defaultWorkflowClock, type WorkflowClock } from "./workflowClock"
 
-export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
+export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload, CTX = never> {
     jobKey?: WorkflowJobKey
     job: WorkflowJobValue<PAYLOAD_T>
     typeIndex?: boolean
@@ -23,17 +23,22 @@ export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
     store?: InMemoryJobStorage<PAYLOAD_T>
     /** Optional clock (defaults to `defaultWorkflowClock`). Pass a
      * `SimulatedWorkflowClock` to drive time deterministically in tests. */
-    clock?: WorkflowClock
+    clock?: WorkflowClock,
+    ctx?: CTX
 }
 
-export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"]> extends JobRunner<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>> {
+export abstract class SimulatedJobRunner<
+    PAYLOAD_T extends BasicJobPayload,
+    T extends PAYLOAD_T["type"],
+    CTX = never
+> extends JobRunner<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>, CTX> {
     readonly memoryStore: InMemoryJobStorage<PAYLOAD_T>
     // Supports both test-driven instantiation (with `job` for auto-seeding)
     // and engine-driven instantiation as a JobRunnerConstructor (job already
     // in the shared store).
-    constructor(options: SimulatedJobRunnerOptions<PAYLOAD_T> | JobRunnerOptions<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>>) {
+    constructor(options: SimulatedJobRunnerOptions<PAYLOAD_T, CTX> | JobRunnerOptions<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>, CTX>) {
         if (!("job" in options)) {
-            super(options)
+            super(options as any)
             this.memoryStore = options.store as InMemoryJobStorage<PAYLOAD_T>
             return
         }
@@ -55,7 +60,8 @@ export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload, T ex
         super({
             pegCounterValue(_) {
 
-            }, jobKey, execution_id, store: storage, ready: seedPromise, type: options.job.payload.type as T, clock: options.clock ?? defaultWorkflowClock
+            }, jobKey, execution_id, store: storage, ready: seedPromise, type: options.job.payload.type as T, clock: options.clock ?? defaultWorkflowClock,
+            context: options.ctx as never,
         })
         this.memoryStore = storage
     }
