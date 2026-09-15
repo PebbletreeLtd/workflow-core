@@ -8,15 +8,17 @@
  * Uses an in-memory storage adapter and creates its own WorkflowEngine
  * (no external DB or server wrapper required).
  */
-import { describe, it, expect, beforeEach } from "vitest"
+import { describe, it, beforeEach } from "node:test"
+import { expect } from "./expect"
 import { v4 } from "uuid"
-import type { WorkflowJobKey } from "../src/workflowTypes"
+import type { WorkflowJobKey } from "../workflowTypes"
 import {
     makeTestJobKey, makeTestJobValue,
     createTestEngine, createTestStorage,
     type TestPayload,
 } from "./harness"
-import type { InMemoryJobStorage } from "../src/inMemoryStorage"
+import type { InMemoryJobStorage } from "../inMemoryStorage"
+import { defaultWorkflowClock } from "../workflowClock"
 
 let storage: InMemoryJobStorage<TestPayload>
 
@@ -33,7 +35,7 @@ async function insertPickableTestJob(overrides?: {
 }): Promise<{ key: WorkflowJobKey }> {
     const key = makeTestJobKey()
     const value = makeTestJobValue({
-        at: overrides?.at ?? Date.now() - 1000,
+        at: overrides?.at ?? defaultWorkflowClock.now() - 1000,
         shouldFail: overrides?.shouldFail,
         failType: overrides?.failType,
         delayMs: overrides?.delayMs ?? 0,
@@ -60,20 +62,19 @@ describe("picking", async () => {
                 executorId,
                 averageWorkload: 0,
                 currentRunning: 0,
+                clock: defaultWorkflowClock,
+                pegCounterValue(_value) {
+
+                },
             })
 
             expect(pickedJobs).toBeGreaterThanOrEqual(1)
 
-            // Give the fire-and-forget job execution a moment to complete
-            await new Promise(r => setTimeout(r, 200))
+            // Wait for the fire-and-forget job to complete (at <= 0 signals cleared)
+            const job = await storage.waitFor(key, j => !!j && j.header.at <= 0)
 
-            const job = await getJob(key)
-
-            // Job should either be picked (execution_id set) or already completed (at <= 0)
-            expect(job).not.toBeNull()
-            expect(
-                job!.header.execution_id !== undefined || job!.header.at <= 0,
-            ).toBe(true)
+            expect(job).not.toBeUndefined()
+            expect(job!.header.execution_id).toBeUndefined()
         } finally {
             engine.Destroy()
         }
@@ -81,7 +82,7 @@ describe("picking", async () => {
 
     it("future-dated job is NOT picked", async () => {
         const key = makeTestJobKey()
-        const value = makeTestJobValue({ at: Date.now() + 60_000 })
+        const value = makeTestJobValue({ at: defaultWorkflowClock.now() + 60_000 })
         await storage.doTn(async txn => {
             txn.job.set(key, value)
         })
@@ -94,6 +95,10 @@ describe("picking", async () => {
                 executorId,
                 averageWorkload: 0,
                 currentRunning: 0,
+                clock: defaultWorkflowClock,
+                pegCounterValue(_value) {
+
+                },
             })
 
             expect(pickedJobs).toBe(0)
@@ -101,7 +106,7 @@ describe("picking", async () => {
             const job = await getJob(key)
             expect(job).not.toBeNull()
             expect(job!.header.execution_id).toBeUndefined()
-            expect(job!.header.at).toBeGreaterThan(Date.now())
+            expect(job!.header.at).toBeGreaterThan(defaultWorkflowClock.now())
         } finally {
             engine.Destroy()
         }

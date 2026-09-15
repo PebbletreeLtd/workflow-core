@@ -18,12 +18,12 @@ import type {
     WorkflowJobError,
     WorkflowRetryPolicy,
 } from "./workflowTypes"
-import { durationMinutes } from "./workflowTypes"
 import { JobError } from "./jobErrors"
 import { computeNextSchedule } from "./schedule"
-import { WorkflowCounter } from "./counter"
+import { iWorkflowCounter } from "./counter"
 import { WorkflowStorageTransaction, WorkflowJobStorage } from "./workflowStorageAdapter"
 import { v4 } from "uuid"
+import { WorkflowClock, WorkflowClockTimerCancel } from "./workflowClock"
 
 /** If a snapshot of the initial retry policy exists, return a fresh policy
  * with the original `max` and `initial_backoff_ms` restored. */
@@ -42,7 +42,9 @@ export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends P
      * Used by SimulatedJobRunner to ensure the seed transaction commits first.
      */
     ready?: Promise<unknown>,
-    type: T
+    type: T,
+    clock: WorkflowClock,
+    pegCounterValue: (value: Partial<iWorkflowCounter>) => void
 }
 
 /** Constructor type for a concrete JobRunner subclass. */
@@ -61,9 +63,9 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
     })()
 
     private completed = false
-    private pushbackTimer: any = undefined
-    private progressTimer: any = undefined
-    private startTime = Date.now()
+    private pushbackTimer: WorkflowClockTimerCancel | undefined = undefined
+    private progressTimer: WorkflowClockTimerCancel | undefined = undefined
+    private startTime;
     private static readonly runningJobs = new Map<string, number>()
     private static totalRunningJobs = 0
     private _store: WorkflowJobStorage<PAYLOAD_T, TXN>
@@ -73,6 +75,8 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
     }> | undefined
     private readonly execution_id: string
     private readonly _ready: Promise<unknown> | undefined
+    protected pegCounterValue: (value: Partial<iWorkflowCounter>) => void
+    readonly clock: WorkflowClock
     readonly jobType: T
     readonly jobKey: Readonly<WorkflowJobKey>
 
@@ -91,6 +95,9 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         this._store = args.store
         this._ready = args.ready
         this.jobType = args.type
+        this.clock = args.clock
+        this.startTime = this.clock.now()
+        this.pegCounterValue = args.pegCounterValue
     }
     /**
      * Implement this method to define the actual work for this job type.
@@ -106,16 +113,15 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         return { total: this.totalRunningJobs, types: Array.from(this.runningJobs) }
     }
 
-    async Wait(duration: number) {
-        if (duration > durationMinutes(2))
-            return Date.now() + duration
-        const deadline = (await this.GetJob()).header.progress_deadline_ms / 2
-        const progress = duration > deadline / 2
-            ? setInterval(() => { this.Progress() }, deadline / 2).unref()
-            : undefined
-        await new Promise(r => setTimeout(r, duration).unref())
-        if (progress) clearInterval(progress)
-        return undefined
+    async Wait(duration: number): Promise<void> {
+        const chunk = (await this.GetJob()).header.progress_deadline_ms / 2
+        const numWaits = Math.ceil(duration / chunk)
+        for (let i = 0; i < numWaits; i++) {
+            const waitedSoFar = i * chunk
+            const thisWait = Math.min(chunk, duration - waitedSoFar)
+            await this.clock.sleep(thisWait);
+            await this.Progress();
+        }
     }
 
     private async GetUpdatedJob(
@@ -152,15 +158,14 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         const job = await this._job
         return job
     }
-
     private async ResetJob(options: { progress: boolean, payload?: Partial<PAYLOAD_T> }) {
         this._job = this._store.doTn(async txn => {
             const job = await this.GetUpdatedJob(txn)
             const amended = { ...job, header: { ...job.header } }
-            if (options.progress) amended.header.at = Date.now() + job.header.lost_deadline_ms
+            if (options.progress) amended.header.at = this.clock.now() + job.header.lost_deadline_ms
             if (options.payload) amended.payload = { ...amended.payload, ...options.payload }
             if (options.progress || !amended.header.last_progress) {
-                amended.header.last_progress = Date.now()
+                amended.header.last_progress = this.clock.now()
             }
             txn.job.set(this.jobKey, amended)
             return amended
@@ -172,26 +177,28 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
     }
 
     private ResetPushBackTimer(duration: number) {
-        if (this.pushbackTimer) clearTimeout(this.pushbackTimer)
-        this.pushbackTimer = setTimeout(async () => {
+        this.pushbackTimer?.cancel();
+        this.pushbackTimer = this.clock.setTimer(async () => {
             try {
                 await this.ResetJob({ progress: false })
             } catch (e) {
                 this.outofProcessError.raise(e)
             }
-        }, duration).unref()
+        }, duration)
     }
 
     private ResetProgressTimer(duration: number) {
-        if (this.progressTimer) clearTimeout(this.progressTimer)
-        this.progressTimer = setTimeout(async () => {
+        this.progressTimer?.cancel();
+        this.progressTimer = this.clock.setTimer(async () => {
             this.outofProcessError.raise(new JobError({ type: "progress-deadline" }))
-        }, duration).unref()
+        }, duration)
     }
 
     private clearTimers() {
-        if (this.progressTimer) clearTimeout(this.progressTimer)
-        if (this.pushbackTimer) clearTimeout(this.pushbackTimer)
+        this.progressTimer?.cancel()
+        this.pushbackTimer?.cancel();
+        this.progressTimer = undefined
+        this.pushbackTimer = undefined
     }
 
     async Progress(payload?: Partial<PAYLOAD_T & { type: T }>) {
@@ -246,7 +253,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                         })
                     } else {
                         // Clear the job (complete or reschedule if repeating)
-                        const next_schedule = computeNextSchedule(job.header)
+                        const next_schedule = computeNextSchedule(job.header, this.clock)
                         if (next_schedule) {
                             console.debug("Rescheduling job for", next_schedule)
                             const retries = restoreRetriesOnSuccess(job.header.retries)
@@ -300,14 +307,14 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                                         }
                                     }
                                     currentJob.header.retries.max--
-                                    currentJob.header.at = Date.now() + currentJob.header.retries.initial_backoff_ms
+                                    currentJob.header.at = this.clock.now() + currentJob.header.retries.initial_backoff_ms
                                     currentJob.header.retries.initial_backoff_ms *= currentJob.header.retries.exponent
                                     currentJob.header.execution_id = undefined
                                     txn.job.set(this.jobKey, currentJob)
                                     return { type: "rescheduled-error", cause: err as any }
                                 } else {
                                     // Clear via schedule or negate at
-                                    const next_schedule = computeNextSchedule(currentJob.header)
+                                    const next_schedule = computeNextSchedule(currentJob.header, this.clock)
                                     if (next_schedule) {
                                         txn.job.set(this.jobKey, {
                                             ...currentJob,
@@ -325,7 +332,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                                 return err
                             case "fatal-error":
                                 // Clear via schedule or negate at
-                                const next_schedule = computeNextSchedule(currentJob.header)
+                                const next_schedule = computeNextSchedule(currentJob.header, this.clock)
                                 if (next_schedule) {
                                     txn.job.set(this.jobKey, {
                                         ...currentJob,
@@ -392,10 +399,10 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
             JobRunner.runningJobs.delete(job.payload.type)
         JobRunner.totalRunningJobs--
 
-        WorkflowCounter.pegValue({
+        this.pegCounterValue({
             jobs: {
                 [job.payload.type]: {
-                    totals: { executed: 1, duration: Date.now() - this.startTime },
+                    totals: { executed: 1, duration: this.clock.now() - this.startTime },
                     outcomes: { [outcome.type]: 1 }
                 }
             }
@@ -411,8 +418,8 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
     ) {
 
         txn.jobLogKey.set(
-            { timestamp: Date.now(), job_id: this.jobKey.job_id, random: v4() },
-            { at: Date.now(), execution_id: this.execution_id, outcome }
+            { timestamp: this.clock.now(), job_id: this.jobKey.job_id, random: v4() },
+            { at: this.clock.now(), execution_id: this.execution_id, outcome }
         )
     }    /**
      * Called on fatal / vanished / rescheduled-error outcomes so the implementer

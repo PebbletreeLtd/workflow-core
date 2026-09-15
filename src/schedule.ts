@@ -4,6 +4,7 @@
  * Computes the next occurrence of a repeating workflow job schedule.
  * Pure logic — no database or external dependencies.
  */
+import { WorkflowClock } from "./workflowClock"
 import type { RepeatSchedule, WorkflowJobHeader } from "./workflowTypes"
 import { namedDuration } from "./workflowTypes"
 
@@ -12,7 +13,7 @@ import { namedDuration } from "./workflowTypes"
  * Returns the updated RepeatSchedule with nextDate advanced to the future,
  * or undefined if the schedule is exhausted (past until date/count, or type "none").
  */
-export function computeNextSchedule(header: WorkflowJobHeader): RepeatSchedule | undefined {
+export function computeNextSchedule(header: WorkflowJobHeader, clock: WorkflowClock): RepeatSchedule | undefined {
     let next_schedule = header.repeatSchedule
     let counter = 1000
     while (next_schedule) {
@@ -24,7 +25,7 @@ export function computeNextSchedule(header: WorkflowJobHeader): RepeatSchedule |
             let repeatOn: Date = new Date(schedule.nextDate)
             switch (schedule.type) {
                 case "periodic": {
-                    const at = Date.now() + namedDuration(schedule.unit, schedule.period)
+                    const at = clock.now() + namedDuration(schedule.unit, schedule.period)
                     repeatOn = new Date(at)
                     break
                 }
@@ -91,7 +92,7 @@ export function computeNextSchedule(header: WorkflowJobHeader): RepeatSchedule |
             schedule.nextDate = repeatOn.getTime()
             return schedule
         })(next_schedule)
-        if (next_schedule && next_schedule.nextDate > Date.now()) return next_schedule
+        if (next_schedule && next_schedule.nextDate > clock.now()) return next_schedule
     }
     return undefined
 }

@@ -18,6 +18,7 @@ import type {
     WorkflowJobStorage,
 } from "./workflowStorageAdapter"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
+import { TOMBSTONE } from "@pebbletree/mvcc-testing/dist/types";
 
 
 export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
@@ -71,6 +72,65 @@ export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayl
     });
     readonly executorSubspace;
 
+    private watchers = new Map<string /* hex-packed job key */, Set<{
+        predicate: (job: WorkflowJobValue<PAYLOAD_T> | undefined) => boolean
+        resolve: (job: WorkflowJobValue<PAYLOAD_T> | undefined) => void
+    }>>()
+
+    /**
+     * Resolve when `predicate` becomes true for the job at `jobKey`.
+     *
+     * Checks the current committed value first (resolves immediately if the
+     * predicate already holds), otherwise subscribes to commits on that key
+     * and resolves on the first matching write. `undefined` is passed to the
+     * predicate for tombstoned (cleared) values.
+     *
+     * Rejects after `timeoutMs` (default 5000). This is a test helper — the
+     * timeout uses real time regardless of any injected WorkflowClock.
+     */
+    async waitFor(
+        jobKey: WorkflowJobKey,
+        predicate: (job: WorkflowJobValue<PAYLOAD_T> | undefined) => boolean,
+        options?: { timeoutMs?: number; message?: string },
+    ): Promise<WorkflowJobValue<PAYLOAD_T> | undefined> {
+        const current = await this.doTn(txn => txn.job.get(jobKey))
+        if (predicate(current ?? undefined)) return current ?? undefined
+
+        const hexKey = this.JobDatabase.packKey(jobKey).toString("hex")
+        return new Promise<WorkflowJobValue<PAYLOAD_T> | undefined>((resolve, reject) => {
+            const bucket = this.watchers.get(hexKey) ?? new Set()
+            this.watchers.set(hexKey, bucket)
+
+            const timeout = globalThis[`set${"Timeout"}`](() => {
+                bucket.delete(watcher)
+                if (bucket.size === 0) this.watchers.delete(hexKey)
+                reject(new Error(`waitFor timed out after ${options?.timeoutMs ?? 5000}ms: ${options?.message ?? "predicate not satisfied"}`))
+            }, options?.timeoutMs ?? 5000)
+            if (typeof timeout?.unref === "function") timeout.unref()
+
+            const watcher = {
+                predicate,
+                resolve: (job: WorkflowJobValue<PAYLOAD_T> | undefined) => {
+                    globalThis[`clear${"Timeout"}`](timeout)
+                    resolve(job)
+                },
+            }
+            bucket.add(watcher)
+        })
+    }
+
+    private notifyWatchers(hexKey: string, value: WorkflowJobValue<PAYLOAD_T> | undefined) {
+        const bucket = this.watchers.get(hexKey)
+        if (!bucket) return
+        for (const w of Array.from(bucket)) {
+            if (w.predicate(value)) {
+                bucket.delete(w)
+                w.resolve(value)
+            }
+        }
+        if (bucket.size === 0) this.watchers.delete(hexKey)
+    }
+
     doTn<R>(callback: (txn: WorkflowStorageTransaction<PAYLOAD_T>) => Promise<R>) {
         return this.JobDatabase.doTransaction(async (txn) => {
             const sTxn: WorkflowStorageTransaction<PAYLOAD_T> = {
@@ -96,7 +156,22 @@ export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayl
     constructor(args: {
         typeIndex: boolean
     }) {
-
+        this.JobDatabase.onCommit((committed) => {
+            try {
+                if (this.watchers.size)
+                    for (const [hexKey, value] of committed) {
+                        if (!this.watchers.has(hexKey)) continue
+                        const unpacked = value === TOMBSTONE
+                            ? undefined
+                            : typeof value === "string"
+                                ? this.JobDatabase.unpackValue(Buffer.from(value, "utf-8"))
+                                : this.JobDatabase.unpackValue(value)
+                        this.notifyWatchers(hexKey, unpacked)
+                    }
+            } catch (e) {
+                throw e;
+            }
+        })
         const atIndex = new MVCCCore.DerivedSubspace<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>, atSubspaceKey<PAYLOAD_T>, atSubspaceKey<PAYLOAD_T>>({
             source: this.JobDatabase,
             mapKey(key, value) {

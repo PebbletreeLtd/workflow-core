@@ -17,7 +17,7 @@ import { WorkflowPicker, type PickContext } from "./workflowPicker"
 import { capabilitiesToBuffer, bufferToCapabilities } from "./workflowCapabilities"
 import { JobRunner, type JobRunnerConstructor } from "./jobRunner"
 import { JobError } from "./jobErrors"
-import { WorkflowCounter } from "./counter"
+import { iWorkflowCounter, WorkflowCounter } from "./counter"
 import {
     TokenRingWorkDistributor,
     TokenFlags,
@@ -29,6 +29,7 @@ import {
     TokenRingOptions,
 } from "@pebbletree/tokenring"
 import { WorkflowStorageTransaction } from "./workflowStorageAdapter"
+import { defaultWorkflowClock, WorkflowClock, WorkflowClockTimerCancel } from "./workflowClock"
 
 // =========================================================================
 // Types
@@ -54,6 +55,8 @@ export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN ex
 
     /** If set, prints a periodic summary at this interval (ms). */
     summaryIntervalMs?: number
+    /** Optional job clock for this engine instance. */
+    clock?: WorkflowClock
 }
 
 // =========================================================================
@@ -62,12 +65,12 @@ export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN ex
 
 export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN extends WorkflowStorageTransaction<PAYLOAD_T>>
     extends TokenRingWorkDistributor {
-
+    private namedCounters = new Map<string, WorkflowCounter>()
     private readonly pickers: WorkflowPicker<PAYLOAD_T, TXN>[]
     private readonly allSortedCapabilities: PAYLOAD_T["type"][]
-    private summaryInterval?: ReturnType<typeof setInterval>
+    private summaryInterval?: WorkflowClockTimerCancel
     protected readonly runners: { [T in PAYLOAD_T["type"]]?: null | undefined | JobRunnerConstructor<PAYLOAD_T, T, TXN> } = {};
-
+    readonly clock: WorkflowClock
     constructor(options: WorkflowEngineOptions<PAYLOAD_T, TXN>) {
         super({
             segment_name: options.segment_name,
@@ -76,6 +79,7 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             capabilities: Buffer.alloc(0),
             storage: options.ringStorage,
         });
+        this.clock = options.clock ?? defaultWorkflowClock
         this.InitialiseRunners();
         this.pickers = options.pickers
         this.allSortedCapabilities = options.allSortedCapabilities
@@ -120,6 +124,8 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
                 supportedTypes,
             },
             isTerminating: () => this.destroyed,
+            clock: this.clock,
+            pegCounterValue: (value) => this.pegCounterValue(value),
         }
 
         this.pick(pickCtx)
@@ -216,6 +222,8 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             execution_id: args.executorId,
             type: args.job.payload.type,
             store: args.picker.storage,
+            clock: this.clock,
+            pegCounterValue: (value) => this.pegCounterValue(value),
         })
         return this.runJob({
             jobKey: args.jobKey,
@@ -250,32 +258,62 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
     async resetLostJobs(executorId: string): Promise<number> {
         let total = 0
         for (const picker of this.pickers) {
-            total += await picker.resetLostJobs(executorId)
+            total += await picker.resetLostJobs(executorId, this)
         }
         return total
     }
 
     /** Stop the summary interval and destroy the ring. */
     override Destroy(cause?: any): void {
-        if (this.summaryInterval) clearInterval(this.summaryInterval)
+        this.summaryInterval?.cancel()
+        this.summaryInterval = undefined;
         super.Destroy(cause)
     }
+    //----------------------------------------------------
+    // Counters
+    //----------------------------------------------------
 
+    CreateCounter(options: { name: string, counter_duration_ms: number }) {
+        console.log(`Creating workflow counter ${JSON.stringify(options)}`)
+        const ret = new WorkflowCounter({
+            counter_duration_ms: options.counter_duration_ms,
+            clock: this.clock,
+        });
+        this.namedCounters.set(options.name, ret);
+        return ret;
+    }
+    private pegCounterValue(value: Partial<iWorkflowCounter>) {
+        for (const counter of Array.from(this.namedCounters.values()))
+            counter.pegValue(value)
+    }
+
+    getCounterValue(name: string) {
+        const counter = this.namedCounters.get(name)
+        if (!counter) throw new Error("Counter not found: " + name)
+        return counter.getCurrentValue()
+    }
+
+    getDefaultCounter() {
+        const counter = Array.from(this.namedCounters.values())[0]
+        if (!counter) throw new Error("Default counter not found")
+        return counter
+    }
     // ------------------------------------------------------------------
     // Internal
     // ------------------------------------------------------------------
 
     private startSummaryInterval(ms: number) {
-        this.summaryInterval = setInterval(() => {
+        this.summaryInterval = this.clock.setTimerInterval(() => {
             try {
                 console.log(
                     "Work summary",
                     JSON.stringify({
                         current: JobRunner.JobRunningCount,
-                        historic: WorkflowCounter.getDefaultCounter().getCurrentValue(),
+                        historic: this.getDefaultCounter().getCurrentValue(),
                     }),
                 )
             } catch { /* swallow — summary is best-effort */ }
-        }, ms).unref()
+        }, ms)
     }
+
 }

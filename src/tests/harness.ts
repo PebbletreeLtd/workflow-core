@@ -13,19 +13,19 @@ import type {
     WorkflowJobKey,
     WorkflowJobValue,
     WorkflowJobHeader,
-    WorkflowJobOutcome,
-} from "../src/workflowTypes"
-import { durationSeconds } from "../src/workflowTypes"
-import { WorkflowEngine } from "../src/workflowEngine"
-import { WorkflowPicker } from "../src/workflowPicker"
-import { capabilitiesToBuffer } from "../src/workflowCapabilities"
-import { JobRunner, type JobRunnerConstructor } from "../src/jobRunner"
-import { SimulatedJobRunner, type SimulatedJobRunnerOptions } from "../src/simulatedJobRunner"
-import { JobError } from "../src/jobErrors"
+} from "../workflowTypes"
+import { durationSeconds } from "../workflowTypes"
+import { WorkflowEngine } from "../workflowEngine"
+import { WorkflowPicker } from "../workflowPicker"
+import { type JobRunnerConstructor } from "../jobRunner"
+import { SimulatedJobRunner } from "../simulatedJobRunner"
+import { JobError } from "../jobErrors"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
-import { InMemoryJobStorage } from "../src/inMemoryStorage"
+import { InMemoryJobStorage } from "../inMemoryStorage"
 import type { TokenRingRegistrationKey, TokenRingRegistrationValue } from "@pebbletree/tokenring"
-import { WorkflowStorageTransaction } from "../src/workflowStorageAdapter"
+import { WorkflowStorageTransaction } from "../workflowStorageAdapter"
+import type { WorkflowClock } from "../workflowClock"
+import { defaultWorkflowClock } from "../workflowClock"
 
 // =========================================================================
 // Test payload type
@@ -76,7 +76,9 @@ export function makeTestJobValue(overrides?: {
     progress_deadline_ms?: number
     retries?: { max: number; initial_backoff_ms: number; exponent: number }
     repeatSchedule?: WorkflowJobHeader["repeatSchedule"]
+    clock?: WorkflowClock
 }): WorkflowJobValue<TestPayload> {
+    const now = overrides?.clock?.now() ?? defaultWorkflowClock.now()
     return {
         payload: {
             type: "_test",
@@ -86,7 +88,7 @@ export function makeTestJobValue(overrides?: {
             progressIntervalMs: overrides?.progressIntervalMs,
         },
         header: {
-            at: overrides?.at ?? Date.now() - 1000,
+            at: overrides?.at ?? now - 1000,
             lost_deadline_ms: durationSeconds(30),
             progress_deadline_ms: overrides?.progress_deadline_ms ?? durationSeconds(10),
             retries: overrides?.retries ?? { max: 0, initial_backoff_ms: 100, exponent: 2 },
@@ -113,11 +115,11 @@ export class TestJobRunner extends SimulatedJobRunner<TestPayload, "_test"> {
             if (progressInterval && progressInterval > 0) {
                 const steps = Math.ceil(delayMs / progressInterval)
                 for (let i = 0; i < steps; i++) {
-                    await new Promise(r => setTimeout(r, progressInterval).unref())
+                    await this.clock.sleep(progressInterval)
                     await this.Progress()
                 }
             } else {
-                await new Promise(r => setTimeout(r, delayMs).unref())
+                await this.clock.sleep(delayMs)
             }
         }
 
@@ -142,6 +144,7 @@ export class TestJobRunner extends SimulatedJobRunner<TestPayload, "_test"> {
 
 export function createTestEngine(
     storage: InMemoryJobStorage<TestPayload>,
+    options?: { clock?: WorkflowClock },
 ) {
     const runners = new Map<TestPayload["type"], JobRunnerConstructor<TestPayload, "_test", WorkflowStorageTransaction<TestPayload>>>()
     runners.set("_test", TestJobRunner as unknown as JobRunnerConstructor<TestPayload, "_test", WorkflowStorageTransaction<TestPayload>>)
@@ -170,11 +173,12 @@ export function createTestEngine(
         }
     }
 
-    const engine = new TestEngine({
+    const engine: WorkflowEngine<TestPayload, WorkflowStorageTransaction<TestPayload>> = new TestEngine({
         pickers: [picker],
         allSortedCapabilities: ALL_SORTED_CAPABILITIES,
         segment_name: "test",
         issuer_id: v4(),
+        clock: options?.clock,
         ringConfig: {
             reregister_time_ms: 60_000,
             token_ack_timeout_ms: 500,

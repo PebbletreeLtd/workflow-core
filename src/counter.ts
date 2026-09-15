@@ -5,6 +5,8 @@
  * execution/duration/outcome counts. No external dependencies.
  */
 
+import { WorkflowClock } from "./workflowClock"
+
 const division_count = 20
 
 export interface iJobSummary {
@@ -71,41 +73,23 @@ const merge = (val1: iWorkflowCounter, val2: Partial<iWorkflowCounter>): iWorkfl
 }
 
 export class WorkflowCounter {
-    private arrayStartTime = Date.now()
+    private arrayStartTime: number;
     private division_history: iWorkflowCounter[] = []
     private division_history_aggregate: iWorkflowCounter | undefined = undefined
     private currentCounter: iWorkflowCounter = zeroValue()
-    private static namedCounters = new Map<string, WorkflowCounter>()
-
-    private constructor(private options: {
-        counter_duration_ms: number
+    constructor(private options: {
+        counter_duration_ms: number,
+        clock: WorkflowClock,
     }) {
+        this.arrayStartTime = options.clock.now()
     }
 
-    static Create(options: { name: string, counter_duration_ms: number }) {
-        console.log(`Creating workflow counter ${JSON.stringify(options)}`)
-        this.namedCounters.set(options.name, new WorkflowCounter(options))
-    }
 
-    static pegValue(value: Partial<iWorkflowCounter>) {
-        for (const counter of Array.from(this.namedCounters.values()))
-            counter.pegValue(value)
-    }
 
-    static getValue(name: string) {
-        const counter = this.namedCounters.get(name)
-        if (!counter) throw new Error("Counter not found: " + name)
-        return counter.getCurrentValue()
-    }
 
-    static getDefaultCounter() {
-        const counter = Array.from(this.namedCounters.values())[0]
-        if (!counter) throw new Error("Default counter not found")
-        return counter
-    }
 
     private ResetDivisions() {
-        const at = Date.now()
+        const at = this.options.clock.now()
         const projectedArrayStartTime = at - (this.options.counter_duration_ms)
         const missedBeats = Math.min(division_count + 1, Math.floor((projectedArrayStartTime - this.arrayStartTime) / (this.options.counter_duration_ms / division_count)))
         if (missedBeats <= 0) return
@@ -122,7 +106,7 @@ export class WorkflowCounter {
         }
     }
 
-    private pegValue(value: Partial<iWorkflowCounter>) {
+    pegValue(value: Partial<iWorkflowCounter>) {
         this.ResetDivisions()
         this.currentCounter = merge(this.currentCounter, value)
     }

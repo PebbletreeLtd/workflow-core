@@ -10,6 +10,7 @@ import { JobRunner, type JobRunnerOptions } from "./jobRunner"
 import { InMemoryJobStorage } from "./inMemoryStorage"
 import { v4 } from "uuid"
 import { WorkflowStorageTransaction } from "./workflowStorageAdapter"
+import { defaultWorkflowClock, type WorkflowClock } from "./workflowClock"
 
 export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
     jobKey?: WorkflowJobKey
@@ -20,6 +21,9 @@ export interface SimulatedJobRunnerOptions<PAYLOAD_T extends BasicJobPayload> {
      * refreshed and a new `execution_id` is stamped) so retry state, backoff,
      * and snapshots carry across successive runs. */
     store?: InMemoryJobStorage<PAYLOAD_T>
+    /** Optional clock (defaults to `defaultWorkflowClock`). Pass a
+     * `SimulatedWorkflowClock` to drive time deterministically in tests. */
+    clock?: WorkflowClock
 }
 
 export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"]> extends JobRunner<PAYLOAD_T, T, WorkflowStorageTransaction<PAYLOAD_T>> {
@@ -48,7 +52,11 @@ export abstract class SimulatedJobRunner<PAYLOAD_T extends BasicJobPayload, T ex
                 header: { ...base.header, execution_id },
             })
         })
-        super({ jobKey, execution_id, store: storage, ready: seedPromise, type: options.job.payload.type as T })
+        super({
+            pegCounterValue(_) {
+
+            }, jobKey, execution_id, store: storage, ready: seedPromise, type: options.job.payload.type as T, clock: options.clock ?? defaultWorkflowClock
+        })
         this.memoryStore = storage
     }
 }

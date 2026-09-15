@@ -8,17 +8,19 @@
  *  - Without typeIndex: candidate.type is undefined → falls through to ringState
  *    logic (or picks everything when no ringState is provided)
  */
-import { describe, it, expect, beforeEach } from "vitest"
+import { describe, it, beforeEach } from "node:test"
+import { expect } from "./expect"
 import { v4 } from "uuid"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
-import { InMemoryJobStorage } from "../src/inMemoryStorage"
-import { WorkflowPicker, type PickContext } from "../src/workflowPicker"
-import { WorkflowEngine } from "../src/workflowEngine"
-import { JobRunner, type JobRunnerConstructor } from "../src/jobRunner"
+import { InMemoryJobStorage } from "../inMemoryStorage"
+import { WorkflowPicker, type PickContext } from "../workflowPicker"
+import { WorkflowEngine } from "../workflowEngine"
+import { JobRunner, type JobRunnerConstructor } from "../jobRunner"
 import { InMemoryTransport, type TokenRingRegistrationKey, type TokenRingRegistrationValue } from "@pebbletree/tokenring"
-import { durationSeconds, type BasicJobPayload, type WorkflowJobKey, type WorkflowJobValue } from "../src/workflowTypes"
+import { durationSeconds, type BasicJobPayload, type WorkflowJobKey, type WorkflowJobValue } from "../workflowTypes"
 import * as tuple from "fdb-tuple"
-import { WorkflowStorageTransaction } from "../src/workflowStorageAdapter"
+import { WorkflowStorageTransaction } from "../workflowStorageAdapter"
+import { defaultWorkflowClock } from "../workflowClock"
 
 // =========================================================================
 // Payload types — two distinct job types
@@ -72,13 +74,13 @@ const ringStore = new MVCCCore.Store<TokenRingRegistrationKey, TokenRingRegistra
 // Helpers
 // =========================================================================
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 async function waitFor(condition: () => boolean, timeoutMs: number, label?: string): Promise<void> {
-    const start = Date.now()
-    while (Date.now() - start < timeoutMs) {
+    const clock = defaultWorkflowClock
+    const start = clock.now()
+    while (clock.now() - start < timeoutMs) {
         if (condition()) return
-        await sleep(50)
+        await defaultWorkflowClock.sleep(50)
     }
     throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label ?? "condition not met"}`)
 }
@@ -97,7 +99,7 @@ function seedJob(
     const value: WorkflowJobValue<MultiPayload> = {
         payload: { type, marker },
         header: {
-            at: overrides?.at ?? Date.now() - 1000,
+            at: overrides?.at ?? defaultWorkflowClock.now() - 1000,
             lost_deadline_ms: durationSeconds(30),
             progress_deadline_ms: durationSeconds(10),
             retries: { max: 0, initial_backoff_ms: 100, exponent: 2 },
@@ -158,6 +160,10 @@ function makePickCtx<PAYLOAD_T extends BasicJobPayload>(overrides?: Partial<Pick
         executorId: v4(),
         averageWorkload: 0,
         currentRunning: 0,
+        clock: defaultWorkflowClock,
+        pegCounterValue(_value) {
+
+        },
         ...overrides,
     }
 }
@@ -181,8 +187,8 @@ describe("multi-picker", () => {
         const storageA = createStorage(true)
         const storageB = createStorage(true)
 
-        await seedJob(storageA, "_alpha", "a1")
-        await seedJob(storageB, "_beta", "b1")
+        const keyA = await seedJob(storageA, "_alpha", "a1")
+        const keyB = await seedJob(storageB, "_beta", "b1")
 
         const pickerA = new WorkflowPicker<MultiPayload, WorkflowStorageTransaction<MultiPayload>>({
             storage: storageA,
@@ -200,7 +206,10 @@ describe("multi-picker", () => {
             const { pickedJobs } = await engine.pick(makePickCtx())
             expect(pickedJobs).toBe(2)
 
-            await sleep(200)
+            await Promise.all([
+                storageA.waitFor(keyA, j => !!j && j.header.at <= 0),
+                storageB.waitFor(keyB, j => !!j && j.header.at <= 0),
+            ])
             expect(completed.alpha).toContain("a1")
             expect(completed.beta).toContain("b1")
         } finally {
@@ -215,7 +224,7 @@ describe("multi-picker", () => {
     it("type-indexed picker only picks jobs matching canRunType", async () => {
         const storage = createStorage(true)
 
-        await seedJob(storage, "_alpha", "alpha-yes")
+        const keyAlpha = await seedJob(storage, "_alpha", "alpha-yes")
         await seedJob(storage, "_beta", "beta-skip")
 
         // This picker only knows about _alpha
@@ -233,7 +242,7 @@ describe("multi-picker", () => {
             const { pickedJobs } = await engine.pick(makePickCtx())
             expect(pickedJobs).toBe(1)
 
-            await sleep(200)
+            await storage.waitFor(keyAlpha, j => !!j && j.header.at <= 0)
             expect(completed.alpha).toContain("alpha-yes")
             expect(completed.beta).not.toContain("beta-skip")
         } finally {
@@ -248,7 +257,7 @@ describe("multi-picker", () => {
     it("non-type-indexed picker resolves type from database and filters correctly", async () => {
         const storage = createStorage(false)
 
-        await seedJob(storage, "_alpha", "noindex-a")
+        const keyAlpha = await seedJob(storage, "_alpha", "noindex-a")
         await seedJob(storage, "_beta", "noindex-b")
 
         const picker = new WorkflowPicker<MultiPayload, WorkflowStorageTransaction<MultiPayload>>({
@@ -266,7 +275,7 @@ describe("multi-picker", () => {
             const { pickedJobs } = await engine.pick(makePickCtx())
             expect(pickedJobs).toBe(1)
 
-            await sleep(200)
+            await storage.waitFor(keyAlpha, j => !!j && j.header.at <= 0)
             expect(completed.alpha).toContain("noindex-a")
             expect(completed.beta).not.toContain("noindex-b")
         } finally {
@@ -339,8 +348,8 @@ describe("multi-picker", () => {
         const indexedStorage = createStorage(true)
         const plainStorage = createStorage(false)
 
-        await seedJob(indexedStorage, "_alpha", "mixed-indexed")
-        await seedJob(plainStorage, "_beta", "mixed-plain")
+        const keyIndexed = await seedJob(indexedStorage, "_alpha", "mixed-indexed")
+        const keyPlain = await seedJob(plainStorage, "_beta", "mixed-plain")
 
         const indexedPicker = new WorkflowPicker<MultiPayload, WorkflowStorageTransaction<MultiPayload>>({
             storage: indexedStorage,
@@ -361,7 +370,10 @@ describe("multi-picker", () => {
             const { pickedJobs } = await engine.pick(makePickCtx())
             expect(pickedJobs).toBe(2)
 
-            await sleep(200)
+            await Promise.all([
+                indexedStorage.waitFor(keyIndexed, j => !!j && j.header.at <= 0),
+                plainStorage.waitFor(keyPlain, j => !!j && j.header.at <= 0),
+            ])
             expect(completed.alpha).toContain("mixed-indexed")
             expect(completed.beta).toContain("mixed-plain")
         } finally {
@@ -415,7 +427,7 @@ describe("multi-picker", () => {
     it("engine with partial runners picks only matching types from indexed storage", async () => {
         const storage = createStorage(true)
 
-        await seedJob(storage, "_alpha", "partial-alpha")
+        const keyAlpha = await seedJob(storage, "_alpha", "partial-alpha")
         await seedJob(storage, "_beta", "partial-beta")
 
         // Only register _alpha runner
@@ -433,7 +445,7 @@ describe("multi-picker", () => {
             const { pickedJobs } = await engine.pick(makePickCtx())
             expect(pickedJobs).toBe(1)
 
-            await sleep(200)
+            await storage.waitFor(keyAlpha, j => !!j && j.header.at <= 0)
             expect(completed.alpha).toContain("partial-alpha")
             expect(completed.beta).not.toContain("partial-beta")
         } finally {

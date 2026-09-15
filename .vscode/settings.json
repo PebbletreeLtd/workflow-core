@@ -1,3 +1,33 @@
 {
-    "typescript.tsdk": "node_modules/typescript/lib"
+    "typescript.tsdk": "node_modules/typescript/lib",
+    "nodejs-testing.extensions": [
+        {
+            "extensions": [
+                "mjs",
+                "cjs",
+                "js"
+            ],
+            "parameters": [
+                "--test-isolation=none",
+                "--enable-source-maps",
+                "--test-timeout=10000",
+                "--test-force-exit",
+            ]
+        }
+    ],
+    "nodejs-testing.debugOptions": {
+        "outFiles": [
+            "${workspaceFolder}/dist/**/*.mjs",
+            "${workspaceFolder}/dist/**/*.js",
+            "!**/node_modules/**"
+        ],
+        "resolveSourceMapLocations": [
+            "${workspaceFolder}/dist/**",
+            "!**/node_modules/**"
+        ],
+        "skipFiles": [
+            "<node_internals>/**",
+            "**/node_modules/**"
+        ],
+    }
 }

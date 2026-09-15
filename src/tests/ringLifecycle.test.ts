@@ -8,22 +8,24 @@
  * workflow-specific behaviour: job picking, execution, capability routing,
  * and lost-job recovery triggered by the ring.
  */
-import { describe, it, expect, afterEach, beforeEach } from "vitest"
+import { describe, it, afterEach, beforeEach } from "node:test"
+import { expect } from "./expect"
 import { v4 } from "uuid"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
 import * as tuple from "fdb-tuple"
 import { InMemoryTransport, type TokenRingRegistrationKey, type TokenRingRegistrationValue, TokenFlags } from "@pebbletree/tokenring"
-import { WorkflowEngine, type WorkflowEngineOptions } from "../src/workflowEngine"
-import { WorkflowPicker } from "../src/workflowPicker"
-import { JobRunner, type JobRunnerConstructor } from "../src/jobRunner"
-import { InMemoryJobStorage } from "../src/inMemoryStorage"
-import { durationSeconds } from "../src/workflowTypes"
+import { WorkflowEngine } from "../workflowEngine"
+import { WorkflowPicker } from "../workflowPicker"
+import { JobRunner, type JobRunnerConstructor } from "../jobRunner"
+import { InMemoryJobStorage } from "../inMemoryStorage"
+import { durationSeconds } from "../workflowTypes"
 import type {
     BasicJobPayload,
     WorkflowJobKey,
     WorkflowJobValue,
-} from "../src/workflowTypes"
-import { WorkflowStorageTransaction } from "../src/workflowStorageAdapter"
+} from "../workflowTypes"
+import { WorkflowStorageTransaction } from "../workflowStorageAdapter"
+import { defaultWorkflowClock } from "../workflowClock"
 
 // =========================================================================
 // Test payload type
@@ -70,13 +72,13 @@ const ringStore = new MVCCCore.Store<TokenRingRegistrationKey, TokenRingRegistra
 // Helpers
 // =========================================================================
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 async function waitFor(condition: () => boolean, timeoutMs: number, label?: string): Promise<void> {
-    const start = Date.now()
-    while (Date.now() - start < timeoutMs) {
+    const clock = defaultWorkflowClock
+    const start = clock.now()
+    while (clock.now() - start < timeoutMs) {
         if (condition()) return
-        await sleep(50)
+        await clock.sleep(50)
     }
     throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label ?? "condition not met"}`)
 }
@@ -93,7 +95,7 @@ function seedJob(storage: InMemoryJobStorage<RingTestPayload>, overrides?: {
     const value: WorkflowJobValue<RingTestPayload> = {
         payload: { type: "_ringtest", marker: overrides?.marker },
         header: {
-            at: overrides?.at ?? Date.now() - 1000,
+            at: overrides?.at ?? defaultWorkflowClock.now() - 1000,
             lost_deadline_ms: durationSeconds(30),
             progress_deadline_ms: durationSeconds(10),
             retries: { max: 0, initial_backoff_ms: 100, exponent: 2 },
@@ -168,7 +170,7 @@ describe("ring lifecycle", () => {
 
     it("single engine starts, receives token, and picks a job", async () => {
         const storage = createJobStorage()
-        const key = seedJob(storage, { marker: "ring-pick-1" })
+        seedJob(storage, { marker: "ring-pick-1" })
 
         const engine = createEngine(storage)
         try {
@@ -276,14 +278,14 @@ describe("ring lifecycle", () => {
 
     it("future-dated job is not picked during ring lifecycle", async () => {
         const storage = createJobStorage()
-        seedJob(storage, { marker: "future-skip", at: Date.now() + 60_000 })
+        seedJob(storage, { marker: "future-skip", at: defaultWorkflowClock.now() + 60_000 })
 
         const engine = createEngine(storage)
         try {
             await engine.Start()
 
             // Give a few token rounds to confirm nothing gets picked
-            await sleep(2000)
+            await defaultWorkflowClock.sleep(2000)
 
             expect(completedJobs).not.toContain("future-skip")
         } finally {
@@ -342,7 +344,7 @@ describe("ring lifecycle", () => {
 
         // Seed a job after destroy — it should never be picked
         seedJob(storage, { marker: "after-destroy" })
-        await sleep(1500)
+        await defaultWorkflowClock.sleep(1500)
 
         expect(completedJobs).not.toContain("after-destroy")
     })

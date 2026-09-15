@@ -5,18 +5,16 @@ import type {
     WorkflowJobLogKey,
     WorkflowJobLogValue,
     BasicJobPayload,
-} from "../src/workflowTypes"
+} from "../workflowTypes"
 import * as tuple from "fdb-tuple"
 import type {
     atSubspaceKey,
-    WorkflowJobStorage,
-} from "../src/workflowStorageAdapter"
+} from "../workflowStorageAdapter"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
 import { TransactionFactory } from "@pebbletree/mvcc-testing/dist/types";
 
 
-export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayload>
-    implements WorkflowJobStorage<PAYLOAD_T> {
+export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayload> {
     readonly JobDatabase = new MVCCCore.Store<WorkflowJobKey, WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>, WorkflowJobValue<PAYLOAD_T>>({
         keyTransformer: {
             pack(value) {
@@ -65,7 +63,7 @@ export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayl
         }
     })
     readonly doTn: TransactionFactory<WorkflowJobKey, WorkflowJobValue<PAYLOAD_T>>;
-    readonly subspaces: WorkflowJobStorage<PAYLOAD_T>["subspaces"]
+    readonly subspaces
     constructor(args: {
         typeIndex: boolean
     }) {
@@ -102,13 +100,13 @@ export class InMemoryJobStorage<PAYLOAD_T extends BasicJobPayload = BasicJobPayl
         this.subspaces = {
             at: this.atIndex.withKeyEncoding({
                 ...this.atIndex.keyXf,
-                pack(value) {
+                pack(value: atSubspaceKey<PAYLOAD_T>) {
                     return tuple.pack([value.at])
                 },
             }),
             executor: this.executorIndex.withKeyEncoding({
                 ...this.executorIndex.keyXf,
-                pack(value) {
+                pack(value: { execution_id: string } & WorkflowJobKey) {
                     return tuple.pack(["executor", value.execution_id])
                 },
             }),

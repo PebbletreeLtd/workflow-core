@@ -14,7 +14,8 @@ import {
     type WorkflowJobValue,
 } from "./workflowTypes"
 import type { atSubspaceKey, WorkflowStorageTransaction, WorkflowJobStorage } from "./workflowStorageAdapter"
-import { WorkflowCounter } from "./counter"
+import { iWorkflowCounter } from "./counter"
+import { WorkflowClock } from "./workflowClock"
 
 // =========================================================================
 // Types
@@ -48,7 +49,9 @@ export interface PickContext<PAYLOAD_T extends BasicJobPayload> {
      * immediately (e.g. graceful shutdown).
      */
     isTerminating?: () => boolean,
-    canRunType: (type: PAYLOAD_T["type"]) => boolean
+    canRunType: (type: PAYLOAD_T["type"]) => boolean,
+    clock: WorkflowClock
+    pegCounterValue: (value: Partial<iWorkflowCounter>) => void
 
 }
 
@@ -110,7 +113,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                         const filtered = await this.storage.doTn(async txn => {
 
                             const filtered: Array<atSubspaceKey<PAYLOAD_T>> = [];
-                            const candidates = txn.at.getRangeSnapshot({ at: 1 }, { at: Date.now() });
+                            const candidates = txn.at.getRangeSnapshot({ at: 1 }, { at: ctx.clock.now() });
                             for await (const [candidate] of candidates) {
                                 let jobType = candidate.type
 
@@ -162,7 +165,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                                 // the issue clears itself up.
                                                 const pushed = {
                                                     ...job,
-                                                    header: { ...job.header, at: Date.now() + durationSeconds(5) },
+                                                    header: { ...job.header, at: ctx.clock.now() + durationSeconds(5) },
                                                 }
                                                 txn.job.set(jobKey, pushed)
                                                 console.log("Refusing to re-adopt own job. Job configuration issue?", jobKey, "Pushed into the future:", pushed)
@@ -175,7 +178,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                             ...job,
                                             header: {
                                                 ...job.header,
-                                                at: Date.now() + job.header.lost_deadline_ms,
+                                                at: ctx.clock.now() + job.header.lost_deadline_ms,
                                                 progress_deadline_ms,
                                                 execution_id: ctx.executorId,
                                             },
@@ -206,7 +209,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                     }
                 })()
 
-                WorkflowCounter.pegValue({
+                ctx.pegCounterValue({
                     picks: {
                         conflicts: !jobs ? 1 : 0,
                         cycles: 1,
@@ -231,7 +234,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
      * Reset all lost jobs for the given executor in this picker's storage.
      * Called when the ring detects an unresponsive server.
      */
-    async resetLostJobs(executorId: string): Promise<number> {
+    async resetLostJobs(executorId: string, ctx: { clock: WorkflowClock }): Promise<number> {
         let total = 0
         let iterEscapeCounter = 1000 // safeguard: at most 50,000 jobs (50 per batch)
 
@@ -260,7 +263,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                     ...job,
                                     header: {
                                         ...job.header,
-                                        at: Date.now(),
+                                        at: ctx.clock.now(),
                                         execution_id: undefined,
                                     },
                                 },

@@ -12,16 +12,19 @@
  *
  * Uses SimulatedJobRunner backed by in-memory storage (no external DB required).
  */
-import { describe, it, expect } from "vitest"
+import { describe, it } from "node:test"
+import { expect } from "./expect"
 import { v4 } from "uuid"
-import { durationSeconds, WorkflowJobKey } from "../src/workflowTypes"
+import { durationSeconds, WorkflowJobKey } from "../workflowTypes"
 import {
     makeTestJobValue,
     TestJobRunner,
     type TestPayload,
 } from "./harness"
-import { SimulatedJobRunner } from "../src/simulatedJobRunner"
-import type { WorkflowStorageTransaction, WorkflowJobStorage } from "../src/workflowStorageAdapter"
+import { SimulatedJobRunner } from "../simulatedJobRunner"
+import { SimulatedWorkflowClock } from "../simulatedWorkflowClock"
+import { defaultWorkflowClock } from "../workflowClock"
+import type { WorkflowStorageTransaction, WorkflowJobStorage } from "../workflowStorageAdapter"
 
 // Helper to create a TestJobRunner with simulated storage
 function setupJobRunner(overrides?: Parameters<typeof makeTestJobValue>[0]) {
@@ -54,19 +57,23 @@ describe("lifecycle", () => {
     // --- Recoverable error with retries ---
 
     it("recoverable error reschedules when retries remain", async () => {
-        const { key, runner, storage } = setupJobRunner({
+        const clock = new SimulatedWorkflowClock(10_000)
+        const value = makeTestJobValue({
+            clock,
             shouldFail: true,
             failType: "recoverable",
             retries: { max: 3, initial_backoff_ms: 100, exponent: 2 },
         })
+        const runner = new TestJobRunner({ job: value, clock })
         const outcome = await runner.Run()
 
         expect(outcome.type).toBe("rescheduled-error")
 
-        const job = await getJob(storage, key)
+        const job = await getJob(runner.store, runner.jobKey)
         expect(job).not.toBeNull()
-        expect(job!.header.at).toBeGreaterThan(Date.now() - 1000)
+        expect(job!.header.at).toBe(10_100)
         expect(job!.header.retries.max).toBe(2)
+        expect(job!.header.retries.initial_backoff_ms).toBe(200)
         expect(job!.header.execution_id).toBeUndefined()
     })
 
@@ -173,7 +180,7 @@ describe("lifecycle", () => {
     // --- Error log written ---
 
     it("error outcome writes to log", async () => {
-        const { key, runner, storage } = setupJobRunner({
+        const { key, runner } = setupJobRunner({
             shouldFail: true,
             failType: "fatal",
         })
@@ -187,7 +194,7 @@ describe("lifecycle", () => {
                 job_id: "",
                 random: ""
             }, {
-                timestamp: Date.now() + durationSeconds(5),
+                timestamp: defaultWorkflowClock.now() + durationSeconds(5),
                 job_id: "",
                 random: ""
             }, { limit: 1000, reverse: true })
@@ -213,7 +220,7 @@ describe("lifecycle", () => {
                 type: "periodic",
                 unit: "minutes",
                 period: 1,
-                nextDate: Date.now(),
+                nextDate: defaultWorkflowClock.now(),
                 until: { format: "forever" },
             },
         })
@@ -237,9 +244,56 @@ describe("lifecycle", () => {
         const afterSuccess = await getJob(first.storage, first.key)
         expect(afterSuccess).not.toBeNull()
         // Rescheduled to next occurrence…
-        expect(afterSuccess!.header.at).toBeGreaterThan(Date.now())
+        expect(afterSuccess!.header.at).toBeGreaterThan(defaultWorkflowClock.now())
         // …with the retry budget fully restored.
         expect(afterSuccess!.header.retries.max).toBe(3)
         expect(afterSuccess!.header.retries.initial_backoff_ms).toBe(100)
+    })
+
+    // --- Exponential backoff sequence across multiple retries ---
+
+    it("exponential backoff advances at and initial_backoff_ms across successive retries", async () => {
+        const clock = new SimulatedWorkflowClock(10_000)
+        const value = makeTestJobValue({
+            clock,
+            shouldFail: true,
+            failType: "recoverable",
+            retries: { max: 3, initial_backoff_ms: 100, exponent: 2 },
+        })
+        const runner1 = new TestJobRunner({ job: value, clock })
+        const key = runner1.jobKey
+        const store = runner1.memoryStore
+
+        const attempts: Array<{ at: number; max: number; backoff: number }> = []
+
+        // Attempt 1 at t=10_000 → at becomes 10_100, backoff doubles to 200
+        expect((await runner1.Run()).type).toBe("rescheduled-error")
+        let job = (await getJob(store, key))!
+        attempts.push({ at: job.header.at, max: job.header.retries.max, backoff: job.header.retries.initial_backoff_ms })
+
+        // Advance to attempt 2's scheduled time
+        await clock.advance(500)
+        const runner2 = new TestJobRunner({ job: value, store, jobKey: key, clock })
+        expect((await runner2.Run()).type).toBe("rescheduled-error")
+        job = (await getJob(store, key))!
+        attempts.push({ at: job.header.at, max: job.header.retries.max, backoff: job.header.retries.initial_backoff_ms })
+
+        // Advance further and try attempt 3
+        await clock.advance(500)
+        const runner3 = new TestJobRunner({ job: value, store, jobKey: key, clock })
+        expect((await runner3.Run()).type).toBe("rescheduled-error")
+        job = (await getJob(store, key))!
+        attempts.push({ at: job.header.at, max: job.header.retries.max, backoff: job.header.retries.initial_backoff_ms })
+
+        expect(attempts).toEqual([
+            { at: 10_100, max: 2, backoff: 200 },  // 10_000 + 100
+            { at: 10_700, max: 1, backoff: 400 },  // 10_500 + 200
+            { at: 11_400, max: 0, backoff: 800 },  // 11_000 + 400
+        ])
+
+        // One more attempt: retries exhausted → fatal-error
+        await clock.advance(500)
+        const runner4 = new TestJobRunner({ job: value, store, jobKey: key, clock })
+        expect((await runner4.Run()).type).toBe("fatal-error")
     })
 })

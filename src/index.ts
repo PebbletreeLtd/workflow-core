@@ -69,7 +69,9 @@ export type { PickContext, PickedJob, WorkflowPickerArgs } from "./workflowPicke
 // Engine (orchestrator + token ring)
 export { WorkflowEngine } from "./workflowEngine"
 export type { WorkflowEngineOptions } from "./workflowEngine"
-
+export type { WorkflowClock, WorkflowClockTimerCancel } from "./workflowClock"
+export { defaultWorkflowClock } from "./workflowClock"
+export { SimulatedWorkflowClock } from "./simulatedWorkflowClock"
 // Re-export token ring types consumers need
 export {
     TokenRingWorkDistributor,

@@ -16,9 +16,9 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "vitest run",
-    "test:verbose": "VERBOSE=1 vitest run",
-    "test:watch": "vitest",
+    "test": "npm run build && node --import ./dist/tests/setup.js --test dist/tests/*.test.js",
+    "test:verbose": "npm run build && VERBOSE=1 node --import ./dist/tests/setup.js --test dist/tests/*.test.js",
+    "test:watch": "npm run build && node --import ./dist/tests/setup.js --test --watch dist/tests/*.test.js",
     "prepublishOnly": "npm run build && npm test"
   },
   "repository": {
@@ -33,9 +33,8 @@
   "homepage": "https://github.com/PebbletreeLtd/workflow-core#readme",
   "devDependencies": {
     "@types/node": "~18.19.130",
-    "uuid": "~8.3.2",
     "typescript": "~5.9.3",
-    "vitest": "~1.6.1"
+    "uuid": "~8.3.2"
   },
   "dependencies": {
     "@pebbletree/mvcc-testing": "~2.1.5",
