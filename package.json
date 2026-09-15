@@ -1,6 +1,6 @@
 {
   "name": "@pebbletree/workflow-core",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Database-agnostic workflow engine for TypeScript — job picking, execution, retry, scheduling, and capability-based routing with pluggable storage adapters",
   "keywords": [
     "workflow",

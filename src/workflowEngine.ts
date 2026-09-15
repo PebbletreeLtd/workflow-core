@@ -230,14 +230,37 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             pegCounterValue: (value) => this.pegCounterValue(value),
             context: this.ctx as never,
         })
-        return this.runJob({
+        const outcome = await this.runJob({
             jobKey: args.jobKey,
             payload: args.job.payload,
             fn: async () => {
                 return await runner.Run()
             },
         })
+        try {
+            await this.OnAfterWorkflowJob({ jobKey: args.jobKey, initialJobValue: args.job, outcome })
+        } catch (e) {
+            console.error("Error in OnAfterWorkflowJob callback", args.jobKey, e)
+        }
+        return outcome
     }
+
+    /**
+     * Called after a job has run and its outcome has been persisted to storage,
+     * outside of any transaction. Override to react to completed jobs
+     * (metrics, notifications, downstream side effects, etc.).
+     *
+     * `initialJobValue` is the snapshot the runner started with (payload +
+     * header). It does not reflect any mutations the runner made mid-run.
+     *
+     * Errors thrown here are logged and swallowed so they do not affect the
+     * job's returned outcome.
+     */
+    OnAfterWorkflowJob(_args: {
+        jobKey: WorkflowJobKey
+        initialJobValue: WorkflowJobValue<PAYLOAD_T>
+        outcome: WorkflowJobOutcome
+    }): Promise<void> | void { }
 
     /**
          * Wraps each job's execution. The consumer can add contextual logging,
