@@ -9,10 +9,12 @@
  */
 import type {
     BasicJobPayload,
+    WorkflowDebugLog,
     WorkflowJobKey,
     WorkflowJobOutcome,
     WorkflowJobValue,
 } from "./workflowTypes"
+import { noopDebugLog } from "./workflowTypes"
 import { WorkflowPicker, type PickContext } from "./workflowPicker"
 import { capabilitiesToBuffer, bufferToCapabilities } from "./workflowCapabilities"
 import { JobRunner, type JobRunnerConstructor } from "./jobRunner"
@@ -59,6 +61,12 @@ export interface WorkflowEngineOptions<PAYLOAD_T extends BasicJobPayload, TXN ex
     summaryIntervalMs?: number
     /** Optional job clock for this engine instance. */
     clock?: WorkflowClock
+    /**
+     * Optional debug logger. Called at every meaningful transition in the
+     * engine → picker → runner pipeline. Wire it to your log framework
+     * when you need to trace a stall.
+     */
+    debugLog?: WorkflowDebugLog
 }
 
 // =========================================================================
@@ -74,6 +82,7 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
     protected readonly runners: { [T in PAYLOAD_T["type"]]?: null | undefined | JobRunnerConstructor<PAYLOAD_T, T, TXN> } = {};
     readonly clock: WorkflowClock
     readonly ctx: CTX
+    readonly debugLog: WorkflowDebugLog
     constructor(options: WorkflowEngineOptions<PAYLOAD_T, TXN, CTX>) {
         super({
             segment_name: options.segment_name,
@@ -83,9 +92,9 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             storage: options.ringStorage,
         });
         this.clock = options.clock ?? defaultWorkflowClock
-        this.InitialiseRunners();
         this.pickers = options.pickers
         this.allSortedCapabilities = options.allSortedCapabilities
+        this.debugLog = options.debugLog ?? noopDebugLog
         // Derive supported capabilities by probing runners (available now that super() has returned)
         this.args.capabilities = capabilitiesToBuffer(
             options.allSortedCapabilities.filter(t => !!this.runners[t]),
@@ -96,10 +105,15 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
         }
         this.ctx = options.ctx || {} as CTX
     }
-    abstract InitialiseRunners(): void;
     AddRunner<T extends PAYLOAD_T["type"]>(type: T) {
         return (runner: JobRunnerConstructor<PAYLOAD_T, T, TXN, CTX> | null): void => {
             this.runners[type] = runner as any
+            // Rebuild the advertised capability bitmap so late-added runners
+            // are reflected in the token this engine emits.
+            this.args.capabilities = capabilitiesToBuffer(
+                this.allSortedCapabilities.filter(t => !!this.runners[t]),
+                this.allSortedCapabilities,
+            )
         }
     }
     // ------------------------------------------------------------------
@@ -112,6 +126,14 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
         done: (workload: { running: number }) => void
         error: (e: any) => void
     }): void {
+        this.debugLog("engine.onToken.enter", {
+            executorId: this.issuer_id,
+            issuedBy: ctx.token.issued_by,
+            issuerVersion: ctx.token.issuer_version,
+            provisional: !!(ctx.token.flags & TokenFlags.provisional),
+            averageWorkload: ctx.token.averageWorkload,
+            running: JobRunner.JobRunningCount.total,
+        })
         const supportedTypes = new Set(
             bufferToCapabilities(
                 ctx.token.capabilities,
@@ -130,13 +152,23 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             isTerminating: () => this.destroyed,
             clock: this.clock,
             pegCounterValue: (value) => this.pegCounterValue(value),
+            debugLog: this.debugLog,
         }
 
         this.pick(pickCtx)
-            .then(() => {
+            .then((result) => {
+                this.debugLog("engine.onToken.done", {
+                    executorId: this.issuer_id,
+                    pickedJobs: result.pickedJobs,
+                    running: JobRunner.JobRunningCount.total,
+                })
                 ctx.done({ running: JobRunner.JobRunningCount.total })
             })
             .catch((e) => {
+                this.debugLog("engine.onToken.error", {
+                    executorId: this.issuer_id,
+                    error: (e as any)?.message ?? String(e),
+                })
                 ctx.error(e)
             })
     }
@@ -145,12 +177,126 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
         key: TokenRingRegistrationKey
         value: TokenRingRegistrationValue
     }): Promise<void> {
+        this.debugLog("engine.ring.onServerUnresponsive.enter", {
+            executorId: this.issuer_id,
+            deadExecutor: registration.value.executor_id,
+            server_ip: registration.key.server_ip,
+            server_port: registration.key.server_port,
+        })
         const count = await this.resetLostJobs(registration.value.executor_id)
         if (count > 0) {
             console.log(
                 `Reset ${count} lost jobs for unresponsive server`,
                 registration.value.executor_id,
             )
+        }
+        this.debugLog("engine.ring.onServerUnresponsive.exit", {
+            executorId: this.issuer_id,
+            deadExecutor: registration.value.executor_id,
+            resetCount: count,
+        })
+    }
+
+    override onError(e: any): void {
+        this.debugLog("engine.ring.onError", {
+            executorId: this.issuer_id,
+            error: (e as any)?.message ?? String(e),
+            stack: (e as any)?.stack,
+        })
+        super.onError(e)
+    }
+
+    override onDestroy(): void {
+        this.debugLog("engine.ring.onDestroy", { executorId: this.issuer_id })
+        super.onDestroy()
+    }
+
+    protected override async TokenReceived(token: Token): Promise<void> {
+        this.debugLog("engine.ring.TokenReceived.enter", {
+            executorId: this.issuer_id,
+            issuedBy: token.issued_by,
+            issuerVersion: token.issuer_version,
+            provisional: !!(token.flags & TokenFlags.provisional),
+            averageWorkload: token.averageWorkload,
+            server_count: token.server_count,
+            destroyed: this.destroyed,
+        })
+        try {
+            await super.TokenReceived(token)
+            this.debugLog("engine.ring.TokenReceived.exit", {
+                executorId: this.issuer_id,
+                issuedBy: token.issued_by,
+                issuerVersion: token.issuer_version,
+            })
+        } catch (e: any) {
+            this.debugLog("engine.ring.TokenReceived.error", {
+                executorId: this.issuer_id,
+                issuedBy: token.issued_by,
+                error: e?.message ?? String(e),
+            })
+            throw e
+        }
+    }
+
+    protected override async MarkServerAsUnresponsive(key: TokenRingRegistrationKey): Promise<void> {
+        this.debugLog("engine.ring.MarkServerAsUnresponsive.enter", {
+            executorId: this.issuer_id,
+            deadServer: key,
+        })
+        try {
+            await super.MarkServerAsUnresponsive(key)
+            this.debugLog("engine.ring.MarkServerAsUnresponsive.exit", {
+                executorId: this.issuer_id,
+                deadServer: key,
+            })
+        } catch (e: any) {
+            this.debugLog("engine.ring.MarkServerAsUnresponsive.error", {
+                executorId: this.issuer_id,
+                error: e?.message ?? String(e),
+            })
+            throw e
+        }
+    }
+
+    protected override async Register(): Promise<void> {
+        this.debugLog("engine.ring.Register.enter", { executorId: this.issuer_id })
+        try {
+            await super.Register()
+            this.debugLog("engine.ring.Register.exit", { executorId: this.issuer_id })
+        } catch (e: any) {
+            this.debugLog("engine.ring.Register.error", {
+                executorId: this.issuer_id,
+                error: e?.message ?? String(e),
+            })
+            throw e
+        }
+    }
+
+    protected override startLostTokenTimer(): void {
+        this.debugLog("engine.ring.startLostTokenTimer", {
+            executorId: this.issuer_id,
+            destroyed: this.destroyed,
+            lastSeenBy: this.last_seen_token.token.issued_by,
+            lastSeenVersion: this.last_seen_token.token.issuer_version,
+        })
+        super.startLostTokenTimer()
+    }
+
+    override async Start(): Promise<this> {
+        this.debugLog("engine.Start.enter", { executorId: this.issuer_id, segment: this.segmentName })
+        try {
+            const ret = await super.Start()
+            this.debugLog("engine.Start.exit", {
+                executorId: this.issuer_id,
+                boundAddress: this.boundAddress,
+            })
+            return ret as this
+        } catch (e: any) {
+            this.debugLog("engine.Start.error", {
+                executorId: this.issuer_id,
+                error: e?.message ?? String(e),
+            })
+            throw e
         }
     }
 
@@ -165,9 +311,11 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
      * — errors are logged but do not propagate.
      */
     async pick(_ctx: Omit<PickContext<PAYLOAD_T>, "canRunType">): Promise<{ pickedJobs: number }> {
+        this.debugLog("engine.pick.enter", { executorId: this.issuer_id, pickerCount: this.pickers.length })
         const ctx: PickContext<PAYLOAD_T> = {
             ..._ctx,
             canRunType: (type) => !!this.runners[type],
+            debugLog: _ctx.debugLog ?? this.debugLog,
         }
         const allPicked = await Promise.all(
             this.pickers.map(async (picker) => ({
@@ -185,13 +333,17 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
                     executorId: job.header.execution_id!,
                 }).catch((e) => {
                     console.error("Fatal error starting job", jobKey, e)
+                    this.debugLog("engine.startJob.fatal", {
+                        job_id: jobKey.job_id,
+                        error: (e as any)?.message ?? String(e),
+                    })
                 })
             }
         }
 
-        return {
-            pickedJobs: allPicked.reduce((sum, { picked }) => sum + picked.length, 0),
-        }
+        const total = allPicked.reduce((sum, { picked }) => sum + picked.length, 0)
+        this.debugLog("engine.pick.exit", { executorId: this.issuer_id, pickedJobs: total })
+        return { pickedJobs: total }
     }
 
     /**
@@ -206,9 +358,18 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
         picker: WorkflowPicker<PAYLOAD_T, TXN>
         executorId: string
     }): Promise<WorkflowJobOutcome> {
+        this.debugLog("engine.startJob.enter", {
+            job_id: args.jobKey.job_id,
+            type: args.job.payload.type,
+            executorId: args.executorId,
+        })
         const RunnerClass = (() => {
             const Cls = this.runners[args.job.payload.type as PAYLOAD_T["type"]]
             if (Cls) return Cls
+            this.debugLog("engine.startJob.noRunner", {
+                job_id: args.jobKey.job_id,
+                type: args.job.payload.type,
+            })
             // Return an error runner so the job goes through the
             // normal retry / fatal-error lifecycle.
             return class ErrorRunner extends JobRunner<PAYLOAD_T, any, TXN> {
@@ -229,6 +390,7 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             clock: this.clock,
             pegCounterValue: (value) => this.pegCounterValue(value),
             context: this.ctx as never,
+            debugLog: this.debugLog,
         })
         const outcome = await this.runJob({
             jobKey: args.jobKey,
@@ -237,10 +399,18 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
                 return await runner.Run()
             },
         })
+        this.debugLog("engine.startJob.outcome", {
+            job_id: args.jobKey.job_id,
+            outcome: outcome.type,
+        })
         try {
             await this.OnAfterWorkflowJob({ jobKey: args.jobKey, initialJobValue: args.job, outcome })
         } catch (e) {
             console.error("Error in OnAfterWorkflowJob callback", args.jobKey, e)
+            this.debugLog("engine.startJob.afterHookError", {
+                job_id: args.jobKey.job_id,
+                error: (e as any)?.message ?? String(e),
+            })
         }
         return outcome
     }
@@ -293,9 +463,15 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
 
     /** Stop the summary interval and destroy the ring. */
     override Destroy(cause?: any): void {
+        this.debugLog("engine.Destroy.enter", {
+            executorId: this.issuer_id,
+            destroyed: this.destroyed,
+            cause: cause ? ((cause as any)?.message ?? String(cause)) : undefined,
+        })
         this.summaryInterval?.cancel()
         this.summaryInterval = undefined;
         super.Destroy(cause)
+        this.debugLog("engine.Destroy.exit", { executorId: this.issuer_id })
     }
     //----------------------------------------------------
     // Counters

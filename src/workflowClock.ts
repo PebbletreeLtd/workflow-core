@@ -3,7 +3,7 @@ export interface WorkflowClockTimerCancel {
 }
 export interface WorkflowClock {
     now(): number,
-    sleep: (ms: number) => Promise<void>,
+    sleep: (ms: number, opts?: { advanceIfSupported?: boolean }) => Promise<void>,
     setTimer: (fn: () => void, ms: number) => WorkflowClockTimerCancel
     setTimerInterval: (fn: () => void, ms: number) => WorkflowClockTimerCancel
 }

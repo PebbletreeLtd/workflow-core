@@ -122,17 +122,13 @@ function createEngine(pickers: WorkflowPicker<MultiPayload, WorkflowStorageTrans
     const r = runners ?? makeRunners()
 
     class ConcreteEngine extends WorkflowEngine<MultiPayload, WorkflowStorageTransaction<MultiPayload>> {
-        InitialiseRunners(): void {
-            for (const [type, runner] of r.entries()) {
-                this.AddRunner(type)(runner)
-            }
-        }
+
 
         protected override createTransport() { return new InMemoryTransport() }
         override getLocalAddress() { return { address: "127.0.0.1" } }
     }
 
-    return new ConcreteEngine({
+    const ret = new ConcreteEngine({
         pickers,
         allSortedCapabilities: ALL_SORTED,
         segment_name: `multi-${v4().slice(0, 8)}`,
@@ -153,6 +149,10 @@ function createEngine(pickers: WorkflowPicker<MultiPayload, WorkflowStorageTrans
             }))
         },
     })
+    for (const [type, runner] of r.entries()) {
+        ret.AddRunner(type)(runner)
+    }
+    return ret
 }
 
 function makePickCtx<PAYLOAD_T extends BasicJobPayload>(overrides?: Partial<PickContext<PAYLOAD_T>>): Omit<PickContext<PAYLOAD_T>, "canRunType"> {

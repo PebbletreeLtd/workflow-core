@@ -11,6 +11,7 @@
  */
 import type {
     BasicJobPayload,
+    WorkflowDebugLog,
     WorkflowJobHeader,
     WorkflowJobKey,
     WorkflowJobValue,
@@ -18,6 +19,7 @@ import type {
     WorkflowJobError,
     WorkflowRetryPolicy,
 } from "./workflowTypes"
+import { noopDebugLog } from "./workflowTypes"
 import { JobError } from "./jobErrors"
 import { computeNextSchedule } from "./schedule"
 import { iWorkflowCounter } from "./counter"
@@ -46,6 +48,8 @@ export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends P
     clock: WorkflowClock,
     pegCounterValue: (value: Partial<iWorkflowCounter>) => void,
     context: CTX
+    /** Optional structured trace hook. Noop when omitted. */
+    debugLog?: WorkflowDebugLog
 }
 
 /** Constructor type for a concrete JobRunner subclass. */
@@ -81,6 +85,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
     readonly clock: WorkflowClock
     readonly jobType: T
     readonly jobKey: Readonly<WorkflowJobKey>
+    readonly debugLog: WorkflowDebugLog
 
     /** The storage adapter backing this runner. */
     get store(): WorkflowJobStorage<PAYLOAD_T, TXN> { return this._store }
@@ -101,6 +106,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         this.startTime = this.clock.now()
         this.pegCounterValue = args.pegCounterValue
         this.context = args.context
+        this.debugLog = args.debugLog ?? noopDebugLog
     }
     /**
      * Implement this method to define the actual work for this job type.
@@ -122,7 +128,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         for (let i = 0; i < numWaits; i++) {
             const waitedSoFar = i * chunk
             const thisWait = Math.min(chunk, duration - waitedSoFar)
-            await this.clock.sleep(thisWait);
+            await this.clock.sleep(thisWait, { advanceIfSupported: true });
             await this.Progress();
         }
     }
@@ -210,16 +216,35 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
 
 
     async Run(): Promise<WorkflowJobOutcome> {
+        this.debugLog("runner.Run.enter", {
+            job_id: this.jobKey.job_id,
+            type: this.jobType,
+            execution_id: this.execution_id,
+        })
         let job: Awaited<ReturnType<typeof this.GetJob>>
         try {
             job = await this.GetJob()
         } catch (e) {
-            if (e instanceof JobError) return e.outcome as WorkflowJobOutcome
+            if (e instanceof JobError) {
+                this.debugLog("runner.Run.getJob.jobError", {
+                    job_id: this.jobKey.job_id,
+                    outcome: e.outcome.type,
+                })
+                return e.outcome as WorkflowJobOutcome
+            }
+            this.debugLog("runner.Run.getJob.error", {
+                job_id: this.jobKey.job_id,
+                error: (e as any)?.message ?? String(e),
+            })
             throw e
         }
         const outcome = await (async () => {
             try {
                 console.debug("Workflow starting job", this.jobKey, job.header, job.payload)
+                this.debugLog("runner.runJob.enter", {
+                    job_id: this.jobKey.job_id,
+                    type: this.jobType,
+                })
                 const running = (JobRunner.runningJobs.get(job.payload.type) || 0) + 1
                 JobRunner.totalRunningJobs++
                 JobRunner.runningJobs.set(job.payload.type, running)
@@ -228,6 +253,10 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                     this.runJob(),
                     this.outofProcessError.promise,
                 ])
+                this.debugLog("runner.runJob.exit", {
+                    job_id: this.jobKey.job_id,
+                    rescheduleAt: typeof result === "number" ? result : undefined,
+                })
                 this.clearTimers()
 
                 // Success path: clear/reschedule + post-processing in one transaction
@@ -282,6 +311,12 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                     : e instanceof Error
                         ? { type: "custom-recoverable", message: e.message }
                         : { type: "custom-recoverable", message: String(e) }
+
+                this.debugLog("runner.runJob.errored", {
+                    job_id: this.jobKey.job_id,
+                    errorType: err.type,
+                    message: (err as any).message,
+                })
 
 
                 // Handle error within a transactional context
@@ -411,6 +446,11 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
             }
         })
         this.completed = true
+        this.debugLog("runner.Run.exit", {
+            job_id: this.jobKey.job_id,
+            outcome: outcome.type,
+            durationMs: this.clock.now() - this.startTime,
+        })
         return outcome
     }
 

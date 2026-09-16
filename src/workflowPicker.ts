@@ -10,6 +10,7 @@
 import {
     durationSeconds,
     type BasicJobPayload,
+    type WorkflowDebugLog,
     type WorkflowJobKey,
     type WorkflowJobValue,
 } from "./workflowTypes"
@@ -52,6 +53,8 @@ export interface PickContext<PAYLOAD_T extends BasicJobPayload> {
     canRunType: (type: PAYLOAD_T["type"]) => boolean,
     clock: WorkflowClock
     pegCounterValue: (value: Partial<iWorkflowCounter>) => void
+    /** Optional structured trace hook. Noop when omitted. */
+    debugLog?: WorkflowDebugLog
 
 }
 
@@ -89,8 +92,18 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
      * responsible for actually running them (via JobRunner / WorkflowEngine).
      */
     async pick(ctx: PickContext<PAYLOAD_T>): Promise<PickedJob<PAYLOAD_T>[]> {
+        const log = ctx.debugLog
+        log?.("picker.pick.enter", {
+            executorId: ctx.executorId,
+            averageWorkload: ctx.averageWorkload,
+            currentRunning: ctx.currentRunning,
+            ringProvisional: ctx.ringState?.isProvisional,
+        })
         try {
-            if (ctx.isTerminating?.()) return []
+            if (ctx.isTerminating?.()) {
+                log?.("picker.pick.terminating", { executorId: ctx.executorId })
+                return []
+            }
 
             const runningRatioToAverage =
                 (0.0001 + ctx.currentRunning) / (0.0001 + ctx.averageWorkload)
@@ -104,8 +117,10 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
 
             let max_cycles = 10
             while (max_cycles-- >= 0) {
+                log?.("picker.cycle.enter", { executorId: ctx.executorId, targetJobs, cyclesLeft: max_cycles })
                 const jobs = await (async (): Promise<PickedJob<PAYLOAD_T>[] | undefined> => {
                     try {
+                        log?.("picker.scan.enter", { executorId: ctx.executorId, at: ctx.clock.now() })
                         // Phase I — snapshot scan for candidate job keys.
                         // The storage adapter uses a snapshot / non-conflicting read
                         // so concurrent inserts don't cause transaction conflicts.
@@ -139,10 +154,12 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                             }
                             return filtered
                         });
+                        log?.("picker.scan.exit", { executorId: ctx.executorId, filteredCount: filtered.length })
 
 
                         // Phase II — adopt each candidate in its own transaction
                         // to minimise conflict surface.
+                        log?.("picker.adopt.enter", { executorId: ctx.executorId, candidates: filtered.length })
                         const results = await Promise.all(
                             filtered.map(async (jobKey) => {
                                 try {
@@ -192,6 +209,7 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                 } catch (e: any) {
                                     if (e?.code === 1020) {
                                         console.warn("Got unexpected conflicts on workflow selection phase II")
+                                        log?.("picker.adopt.conflict", { executorId: ctx.executorId, job_id: jobKey.job_id })
                                         return undefined
                                     }
                                     throw e
@@ -199,10 +217,13 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                             }),
                         )
 
-                        return results.filter((x): x is PickedJob<PAYLOAD_T> => x !== undefined)
+                        const adoptedJobs = results.filter((x): x is PickedJob<PAYLOAD_T> => x !== undefined)
+                        log?.("picker.adopt.exit", { executorId: ctx.executorId, adopted: adoptedJobs.length })
+                        return adoptedJobs
                     } catch (e: any) {
                         if (e?.code === 1020) {
                             console.warn("Got unexpected conflicts on workflow selection snapshot")
+                            log?.("picker.scan.conflict", { executorId: ctx.executorId })
                             return undefined // signal conflict → retry cycle
                         }
                         throw e
@@ -220,12 +241,17 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                     },
                 })
 
-                if (jobs) return jobs
+                if (jobs) {
+                    log?.("picker.pick.exit", { executorId: ctx.executorId, adopted: jobs.length })
+                    return jobs
+                }
             }
 
             console.error("Ran out of conflict cycles")
+            log?.("picker.pick.exhausted", { executorId: ctx.executorId })
         } catch (e) {
             console.error("Unexpected workflow pick error", e)
+            log?.("picker.pick.error", { executorId: ctx.executorId, error: (e as any)?.message ?? String(e) })
         }
         return []
     }

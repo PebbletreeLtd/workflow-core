@@ -166,11 +166,7 @@ export function createTestEngine(
     })
 
     class TestEngine extends WorkflowEngine<TestPayload, WorkflowStorageTransaction<TestPayload>> {
-        InitialiseRunners(): void {
-            for (const [type, runner] of runners.entries()) {
-                this.AddRunner(type)(runner)
-            }
-        }
+
     }
 
     const engine: WorkflowEngine<TestPayload, WorkflowStorageTransaction<TestPayload>> = new TestEngine({
@@ -200,6 +196,8 @@ export function createTestEngine(
             },
         }
     })
-
+    for (const [type, runner] of runners.entries()) {
+        engine.AddRunner(type)(runner)
+    }
     return { engine, picker, runners, storage }
 }

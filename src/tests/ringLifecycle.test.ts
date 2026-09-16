@@ -119,16 +119,11 @@ function createEngine(storage: InMemoryJobStorage<RingTestPayload>, options?: {
     })
 
     class TestEngine extends WorkflowEngine<RingTestPayload, WorkflowStorageTransaction<RingTestPayload>> {
-        InitialiseRunners(): void {
-            for (const [type, runner] of runners.entries()) {
-                this.AddRunner(type)(runner)
-            }
-        }
         protected override createTransport() { return new InMemoryTransport() }
         override getLocalAddress() { return { address: "127.0.0.1" } }
     }
 
-    return new TestEngine({
+    const ret = new TestEngine({
         pickers: [picker],
         allSortedCapabilities: ALL_SORTED,
         segment_name: options?.segment_name ?? `ring-test-${v4().slice(0, 8)}`,
@@ -149,6 +144,10 @@ function createEngine(storage: InMemoryJobStorage<RingTestPayload>, options?: {
             }))
         },
     })
+    for (const [type, runner] of runners.entries()) {
+        ret.AddRunner(type)(runner)
+    }
+    return ret
 }
 
 // =========================================================================

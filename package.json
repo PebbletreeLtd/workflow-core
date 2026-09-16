@@ -1,6 +1,6 @@
 {
   "name": "@pebbletree/workflow-core",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "description": "Database-agnostic workflow engine for TypeScript — job picking, execution, retry, scheduling, and capability-based routing with pluggable storage adapters",
   "keywords": [
     "workflow",
@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "@pebbletree/mvcc-testing": "~2.1.5",
-    "@pebbletree/tokenring": "~2.1.7",
+    "@pebbletree/tokenring": "~2.2.0",
     "@types/uuid": "~8.3.0"
   }
 }

@@ -186,4 +186,13 @@ export interface WorkflowJobLogValue {
     execution_id: string
 }
 
+/**
+ * Optional structured debug logger. Called at key transition points in the
+ * engine / picker / runner pipeline so consumers can trace where a stall
+ * or unexpected exit happens. Defaults to a noop when not supplied.
+ */
+export type WorkflowDebugLog = (...args: any[]) => void
+
+export const noopDebugLog: WorkflowDebugLog = () => { }
+
 

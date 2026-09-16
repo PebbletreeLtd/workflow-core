@@ -61,11 +61,7 @@ describe("engine context", () => {
         })
 
         class TestEngine extends WorkflowEngine<TestPayload, WorkflowStorageTransaction<TestPayload>, TestCtx> {
-            InitialiseRunners(): void {
-                this.AddRunner("_test")(
-                    CtxCapturingRunner as unknown as JobRunnerConstructor<TestPayload, "_test", WorkflowStorageTransaction<TestPayload>, TestCtx>,
-                )
-            }
+
         }
 
         const engine = new TestEngine({
@@ -92,7 +88,9 @@ describe("engine context", () => {
                 },
             },
         })
-
+        engine.AddRunner("_test")(
+            CtxCapturingRunner as unknown as JobRunnerConstructor<TestPayload, "_test", WorkflowStorageTransaction<TestPayload>, TestCtx>,
+        )
         try {
             expect(engine.ctx).toBe(ctx)
 
