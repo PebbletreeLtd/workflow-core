@@ -211,33 +211,6 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
         super.onDestroy()
     }
 
-    protected override async TokenReceived(token: Token): Promise<void> {
-        this.debugLog("engine.ring.TokenReceived.enter", {
-            executorId: this.issuer_id,
-            issuedBy: token.issued_by,
-            issuerVersion: token.issuer_version,
-            provisional: !!(token.flags & TokenFlags.provisional),
-            averageWorkload: token.averageWorkload,
-            server_count: token.server_count,
-            destroyed: this.destroyed,
-        })
-        try {
-            await super.TokenReceived(token)
-            this.debugLog("engine.ring.TokenReceived.exit", {
-                executorId: this.issuer_id,
-                issuedBy: token.issued_by,
-                issuerVersion: token.issuer_version,
-            })
-        } catch (e: any) {
-            this.debugLog("engine.ring.TokenReceived.error", {
-                executorId: this.issuer_id,
-                issuedBy: token.issued_by,
-                error: e?.message ?? String(e),
-            })
-            throw e
-        }
-    }
-
     protected override async MarkServerAsUnresponsive(key: TokenRingRegistrationKey): Promise<void> {
         this.debugLog("engine.ring.MarkServerAsUnresponsive.enter", {
             executorId: this.issuer_id,
@@ -270,16 +243,6 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             })
             throw e
         }
-    }
-
-    protected override startLostTokenTimer(): void {
-        this.debugLog("engine.ring.startLostTokenTimer", {
-            executorId: this.issuer_id,
-            destroyed: this.destroyed,
-            lastSeenBy: this.last_seen_token.token.issued_by,
-            lastSeenVersion: this.last_seen_token.token.issuer_version,
-        })
-        super.startLostTokenTimer()
     }
 
     override async Start(): Promise<this> {

@@ -28,6 +28,7 @@ export type {
     WorkflowJobLogOutcome,
     WorkflowJobLogKey,
     WorkflowJobLogValue,
+    WorkflowDebugLog,
 
 } from "./workflowTypes"
 
@@ -37,6 +38,7 @@ export {
     durationHours,
     durationDays,
     namedDuration,
+    noopDebugLog,
 } from "./workflowTypes"
 
 // Storage adapter
@@ -72,6 +74,7 @@ export type { WorkflowEngineOptions } from "./workflowEngine"
 export type { WorkflowClock, WorkflowClockTimerCancel } from "./workflowClock"
 export { defaultWorkflowClock } from "./workflowClock"
 export { SimulatedWorkflowClock } from "./simulatedWorkflowClock"
+export type { SimulatedWorkflowClockOptions } from "./simulatedWorkflowClock"
 // Re-export token ring types consumers need
 export {
     TokenRingWorkDistributor,

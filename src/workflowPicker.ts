@@ -128,8 +128,10 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                         const filtered = await this.storage.doTn(async txn => {
 
                             const filtered: Array<atSubspaceKey<PAYLOAD_T>> = [];
+                            let seen = 0
                             const candidates = txn.at.getRangeSnapshot({ at: 1 }, { at: ctx.clock.now() });
                             for await (const [candidate] of candidates) {
+                                seen++
                                 let jobType = candidate.type
 
                                 // If the at-index doesn't carry the type (non-type-indexed storage),
@@ -142,16 +144,51 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                 if (jobType && ctx.canRunType(jobType)) {
                                     // This server can handle the type — pick it
                                     filtered.push(candidate)
+                                    log?.("picker.scan.candidate", {
+                                        executorId: ctx.executorId,
+                                        job_id: candidate.job_id,
+                                        at: candidate.at,
+                                        type: jobType,
+                                        reason: "local-supported",
+                                    })
                                 } else if (ctx.ringState && !ctx.ringState.isProvisional) {
                                     // Ring is established — check if *any* server can handle it
                                     if (jobType === undefined || !ctx.ringState.supportedTypes.has(jobType)) {
                                         // Unsupported by the entire ring — pick anyway
                                         // (will fail and reschedule, which clears the queue)
                                         filtered.push(candidate)
+                                        log?.("picker.scan.candidate", {
+                                            executorId: ctx.executorId,
+                                            job_id: candidate.job_id,
+                                            at: candidate.at,
+                                            type: jobType,
+                                            reason: "ring-unsupported",
+                                        })
+                                    } else {
+                                        log?.("picker.scan.dropped", {
+                                            executorId: ctx.executorId,
+                                            job_id: candidate.job_id,
+                                            at: candidate.at,
+                                            type: jobType,
+                                            reason: "other-server-supported",
+                                        })
                                     }
+                                } else {
+                                    log?.("picker.scan.dropped", {
+                                        executorId: ctx.executorId,
+                                        job_id: candidate.job_id,
+                                        at: candidate.at,
+                                        type: jobType,
+                                        reason: jobType ? "local-unsupported-ring-provisional" : "unknown-type",
+                                    })
                                 }
                                 if (filtered.length >= targetJobs) break
                             }
+                            log?.("picker.scan.summary", {
+                                executorId: ctx.executorId,
+                                seen,
+                                filteredCount: filtered.length,
+                            })
                             return filtered
                         });
                         log?.("picker.scan.exit", { executorId: ctx.executorId, filteredCount: filtered.length })
@@ -166,8 +203,26 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                     const adopted = await this.storage.doTn(async txn => {
                                         const job = await txn.job.get(jobKey)
 
-                                        if (!job) return null
-                                        if (job.header.at !== jobKey.at) return null // stale — job was modified since scan
+                                        if (!job) {
+                                            log?.("picker.adopt.skip", {
+                                                executorId: ctx.executorId,
+                                                job_id: jobKey.job_id,
+                                                reason: "missing",
+                                                scannedAt: jobKey.at,
+                                            })
+                                            return null
+                                        }
+                                        if (job.header.at !== jobKey.at) {
+                                            log?.("picker.adopt.skip", {
+                                                executorId: ctx.executorId,
+                                                job_id: jobKey.job_id,
+                                                reason: "at-mismatch",
+                                                scannedAt: jobKey.at,
+                                                jobAt: job.header.at,
+                                                execution_id: job.header.execution_id,
+                                            })
+                                            return null // stale — job was modified since scan
+                                        }
 
                                         // Fix bad configuration: lost_deadline must be at least 2× progress_deadline
                                         let progress_deadline_ms = job.header.progress_deadline_ms
@@ -185,9 +240,21 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                                     header: { ...job.header, at: ctx.clock.now() + durationSeconds(5) },
                                                 }
                                                 txn.job.set(jobKey, pushed)
+                                                log?.("picker.adopt.skip", {
+                                                    executorId: ctx.executorId,
+                                                    job_id: jobKey.job_id,
+                                                    reason: "self-adopt-refused",
+                                                    scannedAt: jobKey.at,
+                                                    pushedTo: pushed.header.at,
+                                                })
                                                 console.log("Refusing to re-adopt own job. Job configuration issue?", jobKey, "Pushed into the future:", pushed)
                                                 return null
                                             }
+                                            log?.("picker.adopt.lost", {
+                                                executorId: ctx.executorId,
+                                                job_id: jobKey.job_id,
+                                                previousExecutor: job.header.execution_id,
+                                            })
                                             console.log("Adopted lost job", jobKey, "from executor", job.header.execution_id)
                                         }
 
@@ -201,6 +268,12 @@ export class WorkflowPicker<PAYLOAD_T extends BasicJobPayload, TXN extends Workf
                                             },
                                         }
                                         txn.job.set({ job_id: jobKey.job_id }, adopted)
+                                        log?.("picker.adopt.taken", {
+                                            executorId: ctx.executorId,
+                                            job_id: jobKey.job_id,
+                                            scannedAt: jobKey.at,
+                                            newAt: adopted.header.at,
+                                        })
                                         return adopted
                                     });
 
