@@ -99,7 +99,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
      */
     async whenReady(): Promise<void> { if (this._ready) await this._ready }
 
-    constructor(args: JobRunnerOptions<PAYLOAD_T, T, TXN>) {
+    constructor(args: JobRunnerOptions<PAYLOAD_T, T, TXN, CTX>) {
         this.execution_id = args.execution_id
         this.jobKey = args.jobKey
         this._store = args.store
