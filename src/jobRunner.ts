@@ -52,10 +52,13 @@ export interface JobRunnerOptions<PAYLOAD_T extends BasicJobPayload, T extends P
     debugLog?: WorkflowDebugLog
 }
 
+
+export type JobRunnerClosure<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>, CTX = never> =
+    (args: JobRunnerOptions<PAYLOAD_T, T, TXN, CTX>) => JobRunner<PAYLOAD_T, T, TXN, CTX>
+
 /** Constructor type for a concrete JobRunner subclass. */
 export type JobRunnerConstructor<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>, CTX = never> =
     { new(args: JobRunnerOptions<PAYLOAD_T, T, TXN, CTX>): JobRunner<PAYLOAD_T, T, TXN, CTX> }
-
 
 
 export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAYLOAD_T["type"], TXN extends WorkflowStorageTransaction<PAYLOAD_T>, CTX = never> {

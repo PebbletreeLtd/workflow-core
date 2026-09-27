@@ -17,7 +17,7 @@ import type {
 import { noopDebugLog } from "./workflowTypes"
 import { WorkflowPicker, type PickContext } from "./workflowPicker"
 import { capabilitiesToBuffer, bufferToCapabilities } from "./workflowCapabilities"
-import { JobRunner, type JobRunnerConstructor } from "./jobRunner"
+import { JobRunner, JobRunnerClosure, JobRunnerOptions, type JobRunnerConstructor } from "./jobRunner"
 import { JobError } from "./jobErrors"
 import { iWorkflowCounter, WorkflowCounter } from "./counter"
 import {
@@ -79,7 +79,7 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
     private readonly pickers: WorkflowPicker<PAYLOAD_T, TXN>[]
     private readonly allSortedCapabilities: PAYLOAD_T["type"][]
     private summaryInterval?: WorkflowClockTimerCancel
-    protected readonly runners: { [T in PAYLOAD_T["type"]]?: null | undefined | JobRunnerConstructor<PAYLOAD_T, T, TXN> } = {};
+    protected readonly runners: { [T in PAYLOAD_T["type"]]?: null | undefined | JobRunnerClosure<PAYLOAD_T, T, TXN, CTX> } = {};
     readonly clock: WorkflowClock
     readonly ctx: CTX
     readonly debugLog: WorkflowDebugLog
@@ -107,7 +107,16 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
     }
     AddRunner<T extends PAYLOAD_T["type"]>(type: T) {
         return (runner: JobRunnerConstructor<PAYLOAD_T, T, TXN, CTX> | null): void => {
-            this.runners[type] = runner as any
+            return this.AddRunnerClosure(type)(
+                runner
+                    ? (args: JobRunnerOptions<PAYLOAD_T, T, TXN, CTX>) => new runner(args)
+                    : null
+            )
+        }
+    }
+    AddRunnerClosure<T extends PAYLOAD_T["type"]>(type: T) {
+        return (runner: JobRunnerClosure<PAYLOAD_T, T, TXN, CTX> | null): void => {
+            this.runners[type] = runner
             // Rebuild the advertised capability bitmap so late-added runners
             // are reflected in the token this engine emits.
             this.args.capabilities = capabilitiesToBuffer(
@@ -335,17 +344,10 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
             })
             // Return an error runner so the job goes through the
             // normal retry / fatal-error lifecycle.
-            return class ErrorRunner extends JobRunner<PAYLOAD_T, any, TXN> {
-                async runJob(): Promise<void | number> {
-                    throw new JobError({
-                        type: "custom-recoverable",
-                        message: `No runner found for capability ${args.job.payload.type}`,
-                    })
-                }
-            }
+            return (args: JobRunnerOptions<any, any, any>) => new ErrorRunner(args)
         })()
 
-        const runner = new RunnerClass({
+        const runner = RunnerClass({
             jobKey: args.jobKey,
             execution_id: args.executorId,
             type: args.job.payload.type,
@@ -483,4 +485,13 @@ export abstract class WorkflowEngine<PAYLOAD_T extends BasicJobPayload, TXN exte
         }, ms)
     }
 
+}
+
+class ErrorRunner extends JobRunner<any, any, any> {
+    async runJob(): Promise<void | number> {
+        throw new JobError({
+            type: "custom-recoverable",
+            message: `No runner found for capability ${this.jobType}`,
+        })
+    }
 }
