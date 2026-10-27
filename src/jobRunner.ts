@@ -136,7 +136,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         }
     }
 
-    private async GetUpdatedJob(
+    async GetUpdatedJob(
         txn?: TXN
     ): Promise<{
         header: Readonly<WorkflowJobHeader>
@@ -170,7 +170,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
         const job = await this._job
         return job
     }
-    private async ResetJob(options: { progress: boolean, payload?: Partial<PAYLOAD_T> }) {
+    private async ResetJob(options: { progress: boolean, payload?: Partial<PAYLOAD_T> }): Promise<{ header: Readonly<WorkflowJobHeader>, payload: PAYLOAD_T & { type: T } }> {
         this._job = this._store.doTn(async txn => {
             const job = await this.GetUpdatedJob(txn)
             const amended = { ...job, header: { ...job.header } }
