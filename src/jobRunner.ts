@@ -314,7 +314,13 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                     : e instanceof Error
                         ? { type: "custom-recoverable", message: e.message }
                         : { type: "custom-recoverable", message: String(e) }
-                err.originalError = e;
+                //set original error in such a way that it won't be serailised as it often contains curcular refs
+                Object.defineProperty(err, "originalError", {
+                    value: e,
+                    enumerable: false,
+                    writable: true,
+                    configurable: true
+                });
                 this.debugLog("runner.runJob.errored", {
                     job_id: this.jobKey.job_id,
                     errorType: err.type,
