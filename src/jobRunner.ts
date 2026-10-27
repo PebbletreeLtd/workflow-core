@@ -314,7 +314,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                     : e instanceof Error
                         ? { type: "custom-recoverable", message: e.message }
                         : { type: "custom-recoverable", message: String(e) }
-
+                err.originalError = e;
                 this.debugLog("runner.runJob.errored", {
                     job_id: this.jobKey.job_id,
                     errorType: err.type,

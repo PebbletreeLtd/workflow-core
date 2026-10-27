@@ -143,12 +143,14 @@ export type WorkflowJobValue<PAYLOAD_T extends BasicJobPayload> = {
 // =========================================================================
 
 export type WorkflowJobError =
-    | { type: "vanished" }
-    | { type: "fatal-error", cause: WorkflowJobErrorCause }
-    | { type: "readopted", by: string }
-    | { type: "payloadMismatch" }
-    | { type: "progress-deadline" }
-    | { type: "custom-recoverable", message: string }
+    (| { type: "vanished" }
+        | { type: "fatal-error", cause: WorkflowJobErrorCause }
+        | { type: "readopted", by: string }
+        | { type: "payloadMismatch" }
+        | { type: "progress-deadline" }
+        | { type: "custom-recoverable", message: string }) & {
+            originalError?: unknown
+        }
 
 export type WorkflowJobErrorCause =
     | { type: "payloadMismatch" }
