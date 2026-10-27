@@ -358,7 +358,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                                     currentJob.header.retries.initial_backoff_ms *= currentJob.header.retries.exponent
                                     currentJob.header.execution_id = undefined
                                     txn.job.set(this.jobKey, currentJob)
-                                    return { type: "rescheduled-error", cause: err as any }
+                                    return { type: "rescheduled-error", cause: err as any, originalError: err.originalError ?? null }
                                 } else {
                                     // Clear via schedule or negate at
                                     const next_schedule = computeNextSchedule(currentJob.header, this.clock)
@@ -427,7 +427,7 @@ export abstract class JobRunner<PAYLOAD_T extends BasicJobPayload, T extends PAY
                             }
                             break
                         default:
-                            outcome.type satisfies "readopted" | "rescheduled-error" | "success"
+                            outcome.type satisfies "readopted" | "rescheduled-error" | "success" | "payloadMismatch" | "progress-deadline" | "custom-recoverable"
                     }
                     return outcome
                 });

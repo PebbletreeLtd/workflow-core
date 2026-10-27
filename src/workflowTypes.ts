@@ -159,11 +159,9 @@ export type WorkflowJobErrorCause =
     | { type: "custom-recoverable", message: string }
 
 export type WorkflowJobOutcome =
-    | { type: "vanished" }
-    | { type: "fatal-error", cause: WorkflowJobErrorCause }
-    | { type: "readopted", by: string }
+    | WorkflowJobError
     | { type: "success" }
-    | { type: "rescheduled-error", cause: { type: "payloadMismatch" } | { type: "progress-deadline" } | { type: "custom-recoverable", message: string } }
+    | { type: "rescheduled-error", originalError: unknown | null, cause: { type: "payloadMismatch" } | { type: "progress-deadline" } | { type: "custom-recoverable", message: string } }
 
 // =========================================================================
 // Job log types
